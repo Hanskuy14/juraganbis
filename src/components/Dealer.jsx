@@ -4,9 +4,11 @@ import { BUS_TYPES } from '../data/busTypes';
 import { formatIDR, formatNumber } from '../utils/format';
 
 export default function Dealer({ onTabChange }) {
-  const { state, buyBus } = useGame();
+  const { state, buyBus, garageCap } = useGame();
   const [purchasing, setPurchasing] = useState(null); // busTypeId
   const [customName, setCustomName] = useState('');
+
+  const garageFull = state.fleet.length >= garageCap;
 
   const handleConfirmPurchase = (busType) => {
     buyBus(busType.id, customName);
@@ -34,6 +36,24 @@ export default function Dealer({ onTabChange }) {
               {formatIDR(state.balance)}
             </div>
           </div>
+          <div
+            className={`rounded-xl border px-3 py-2 text-right ${
+              garageFull
+                ? 'border-rose-400/40 bg-rose-500/10'
+                : 'border-white/10 bg-black/20'
+            }`}
+          >
+            <div className="text-[10px] uppercase tracking-wider text-white/50">
+              Slot Garasi
+            </div>
+            <div
+              className={`font-display text-base font-bold ${
+                garageFull ? 'text-rose-300' : 'text-white'
+              }`}
+            >
+              {state.fleet.length}/{garageCap}
+            </div>
+          </div>
           <button
             onClick={() => onTabChange('garasi')}
             className="btn-secondary text-xs"
@@ -43,9 +63,26 @@ export default function Dealer({ onTabChange }) {
         </div>
       </section>
 
+      {garageFull && (
+        <div className="glass-panel flex flex-col items-start gap-3 border-rose-400/30 bg-rose-500/[0.04] p-4 text-sm text-rose-100 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="font-display text-sm font-bold text-rose-200">
+              Garasi penuh ({state.fleet.length}/{garageCap})
+            </div>
+            <div className="text-xs text-rose-100/80">
+              Upgrade Garasi Pusat di tab Aset, atau jual bus lama lewat Garasi.
+            </div>
+          </div>
+          <button onClick={() => onTabChange('aset')} className="btn-secondary text-xs">
+            🏗️ Upgrade Garasi
+          </button>
+        </div>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-3">
         {BUS_TYPES.map((bt) => {
           const canAfford = state.balance >= bt.price;
+          const blocked = garageFull;
           return (
             <article
               key={bt.id}
@@ -82,7 +119,7 @@ export default function Dealer({ onTabChange }) {
                   </span>
                 </div>
 
-                {!canAfford && (
+                {!canAfford && !blocked && (
                   <div className="mt-2 rounded-lg border border-rose-400/30 bg-rose-500/10 px-3 py-1.5 text-[11px] text-rose-200">
                     Saldo kurang {formatIDR(bt.price - state.balance)}
                   </div>
@@ -90,14 +127,18 @@ export default function Dealer({ onTabChange }) {
 
                 <button
                   type="button"
-                  disabled={!canAfford}
+                  disabled={!canAfford || blocked}
                   onClick={() => {
                     setPurchasing(bt.id);
                     setCustomName('');
                   }}
                   className="btn-primary mt-3 w-full"
                 >
-                  {canAfford ? 'Beli Bus' : 'Belum Mampu'}
+                  {blocked
+                    ? 'Garasi penuh'
+                    : canAfford
+                    ? 'Beli Bus'
+                    : 'Belum Mampu'}
                 </button>
               </div>
             </article>

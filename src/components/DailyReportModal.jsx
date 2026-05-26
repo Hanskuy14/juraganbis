@@ -5,12 +5,14 @@ import { formatIDR, formatNumber, formatPercent } from '../utils/format';
 export default function DailyReportModal() {
   const { state, clearReport } = useGame();
   const report = state.lastReport;
-  if (!report) return null;
+  // Hide the daily report when the game-over modal is up — that takes priority.
+  if (!report || state.gameOver) return null;
 
-  const { day, rows, totals, event } = report;
+  const { day, rows, totals, event, ledger } = report;
   const dispatchedRows = rows.filter((r) => !r.idle);
   const idleRows = rows.filter((r) => r.idle);
-  const profitable = totals.profit >= 0;
+  const netProfit = ledger?.netProfit ?? totals.profit;
+  const profitable = netProfit >= 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/70 p-3 backdrop-blur-sm sm:items-center sm:p-4">
@@ -39,7 +41,9 @@ export default function DailyReportModal() {
               <p className="mt-1 text-sm text-white/60">
                 {totals.dispatched} bus berangkat · {totals.idle} bus istirahat
                 {totals.breakdowns > 0 && (
-                  <span className="ml-2 text-rose-300">· {totals.breakdowns}× MOGOK</span>
+                  <span className="ml-2 text-rose-300">
+                    · {totals.breakdowns}× MOGOK
+                  </span>
                 )}
               </p>
             </div>
@@ -50,29 +54,22 @@ export default function DailyReportModal() {
 
           {event && <EventBanner event={event} />}
 
-          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
-            <Summary label="Pendapatan" value={formatIDR(totals.revenue)} tone="emerald" />
-            <Summary label="Biaya BBM" value={formatIDR(totals.fuelCost)} tone="rose" />
-            <Summary label="Gaji Kru" value={formatIDR(totals.salaries)} tone="rose" />
-            <Summary
-              label="Lain-lain"
-              value={formatIDR((totals.extraExpense || 0) + (totals.repairFine || 0))}
-              tone="rose"
-              hint={totals.repairFine > 0 ? 'termasuk denda mogok' : 'razia / lain-lain'}
-            />
-            <Summary
-              label="Profit Bersih"
-              value={formatIDR(totals.profit)}
-              tone={profitable ? 'amber' : 'rose'}
-              big
-            />
-          </div>
-          <div className="mt-1 text-right text-[11px] text-white/45">
-            Total penumpang: {formatNumber(totals.passengers)} orang
-          </div>
+          {ledger && <BalanceHeadline ledger={ledger} netProfit={netProfit} />}
         </header>
 
-        <div className="flex-1 space-y-4 overflow-y-auto p-5">
+        <div className="flex-1 space-y-5 overflow-y-auto p-5">
+          {/* Money breakdown — the single source of truth for "where did
+              the money go today?" Itemized so the player sees every line. */}
+          {ledger && <MoneyBreakdown ledger={ledger} totals={totals} />}
+
+          {/* Reputation delta */}
+          {ledger && (
+            <ReputationCard
+              delta={ledger.reputationDelta}
+              after={ledger.reputationAfter}
+            />
+          )}
+
           {dispatchedRows.length > 0 && (
             <section>
               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-white/55">
@@ -116,7 +113,7 @@ export default function DailyReportModal() {
 
         <footer className="flex items-center justify-between gap-3 border-t border-white/10 bg-black/20 p-4">
           <p className="text-[11px] text-white/50">
-            Hari {day} → Hari {day + 1}. Saldo & stamina otomatis disesuaikan.
+            Hari {day} → Hari {day + 1}. Saldo, stamina, dan reputasi otomatis disesuaikan.
           </p>
           <button onClick={clearReport} className="btn-primary">
             Lanjutkan ke hari berikutnya
@@ -124,6 +121,190 @@ export default function DailyReportModal() {
         </footer>
       </div>
     </div>
+  );
+}
+
+// Hero "balance moved from X to Y" line right under the header.
+function BalanceHeadline({ ledger, netProfit }) {
+  const tone =
+    netProfit >= 0
+      ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-100'
+      : 'border-rose-400/30 bg-rose-500/10 text-rose-100';
+  const arrow = netProfit >= 0 ? '↑' : '↓';
+  const sign = netProfit >= 0 ? '+' : '−';
+  return (
+    <div className={`mt-3 rounded-xl border px-4 py-3 ${tone}`}>
+      <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
+        <span className="text-white/70">Saldo PO</span>
+        <span className="font-display text-lg font-bold text-white">
+          {formatIDR(ledger.balanceBefore)}
+          <span className="mx-2 text-white/45">→</span>
+          {formatIDR(ledger.balanceAfter)}
+        </span>
+      </div>
+      <div className="mt-1 flex items-center justify-between text-xs">
+        <span className="opacity-80">
+          {arrow} Perubahan bersih hari ini
+        </span>
+        <span className="font-bold">
+          {sign}
+          {formatIDR(Math.abs(netProfit))}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// Itemized "End of Day Summary" — shows exactly where the money went.
+function MoneyBreakdown({ ledger, totals }) {
+  const lines = [
+    {
+      label: 'Pendapatan Tiket',
+      amount: ledger.revenue,
+      sign: '+',
+      tone: 'text-emerald-300',
+      icon: '🎫',
+    },
+    ledger.restAreaIncome > 0 && {
+      label: 'Komisi Rest Area',
+      amount: ledger.restAreaIncome,
+      sign: '+',
+      tone: 'text-emerald-300',
+      icon: '🍱',
+      hint: `${formatNumber(ledger.passengers)} penumpang × tarif komisi`,
+    },
+    {
+      label: 'Biaya BBM (Solar)',
+      amount: ledger.fuelCost,
+      sign: '−',
+      tone: 'text-rose-300',
+      icon: '⛽',
+    },
+    {
+      label: 'Gaji Supir',
+      amount: ledger.driverSalaries,
+      sign: '−',
+      tone: 'text-rose-300',
+      icon: '👤',
+    },
+    ledger.kernetSalaries > 0 && {
+      label: 'Gaji Kernet',
+      amount: ledger.kernetSalaries,
+      sign: '−',
+      tone: 'text-rose-300',
+      icon: '🎫',
+    },
+    (ledger.repairFine > 0 || ledger.extraExpense > 0) && {
+      label: 'Perbaikan & Lain-lain',
+      amount: (ledger.repairFine || 0) + (ledger.extraExpense || 0),
+      sign: '−',
+      tone: 'text-rose-300',
+      icon: '🛠️',
+      hint:
+        ledger.repairFine > 0
+          ? `Termasuk denda mogok ${formatIDR(ledger.repairFine)}`
+          : 'Razia / kejadian jalan',
+    },
+    ledger.loanTotal > 0 && {
+      label: 'Cicilan Bank',
+      amount: ledger.loanTotal,
+      sign: '−',
+      tone: 'text-amber-300',
+      icon: '🏦',
+      hint: `${formatIDR(ledger.loanInstallment)} pokok + ${formatIDR(
+        ledger.loanInterest
+      )} bunga`,
+    },
+  ].filter(Boolean);
+
+  return (
+    <section>
+      <h4 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-white/55">
+        💸 Rincian Uang Hari Ini
+        <span className="font-normal normal-case tracking-normal text-white/40">
+          (End of Day Summary)
+        </span>
+      </h4>
+      <div className="overflow-hidden rounded-xl border border-white/10 bg-black/25">
+        {lines.map((line, idx) => (
+          <BreakdownRow key={`${line.label}-${idx}`} line={line} />
+        ))}
+        <div className="flex items-center justify-between gap-3 border-t border-white/10 bg-black/40 px-4 py-3 text-sm">
+          <div className="flex items-center gap-2">
+            <span className="text-base">📊</span>
+            <span className="font-display font-bold text-white">
+              Total Bersih
+            </span>
+          </div>
+          <span
+            className={`font-display text-lg font-extrabold ${
+              ledger.netProfit >= 0 ? 'text-emerald-300' : 'text-rose-300'
+            }`}
+          >
+            {ledger.netProfit >= 0 ? '+' : '−'}
+            {formatIDR(Math.abs(ledger.netProfit))}
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function BreakdownRow({ line }) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-white/5 px-4 py-2.5 last:border-b-0">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span className="text-base shrink-0">{line.icon}</span>
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-white/85">
+            {line.label}
+          </div>
+          {line.hint && (
+            <div className="truncate text-[11px] text-white/45">{line.hint}</div>
+          )}
+        </div>
+      </div>
+      <div className={`font-display text-sm font-bold ${line.tone}`}>
+        {line.sign}
+        {formatIDR(line.amount)}
+      </div>
+    </div>
+  );
+}
+
+function ReputationCard({ delta, after }) {
+  if (delta === 0) {
+    return (
+      <section className="rounded-xl border border-white/10 bg-black/25 px-4 py-3 text-sm text-white/65">
+        Reputasi tetap di <span className="font-bold text-white">{after}</span>/1000.
+      </section>
+    );
+  }
+  const positive = delta > 0;
+  return (
+    <section
+      className={`rounded-xl border px-4 py-3 text-sm ${
+        positive
+          ? 'border-fuchsia-400/30 bg-fuchsia-500/10 text-fuchsia-100'
+          : 'border-rose-400/30 bg-rose-500/10 text-rose-100'
+      }`}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <span className="text-lg">{positive ? '⭐' : '⚠️'}</span>
+          <span className="font-display font-bold">
+            Reputasi {positive ? 'naik' : 'turun'}
+          </span>
+        </div>
+        <div className="text-right">
+          <div className="font-display text-base font-extrabold">
+            {positive ? '+' : ''}
+            {delta}
+          </div>
+          <div className="text-[11px] opacity-80">sekarang {after}/1000</div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -144,32 +325,14 @@ function EventBanner({ event }) {
     <div className={`mt-3 rounded-xl border px-3 py-2 text-xs ${tone}`}>
       <div className="flex items-center gap-2">
         <span className="text-base">{event.icon}</span>
-        <span className="font-semibold uppercase tracking-wider opacity-80">Kejadian:</span>
+        <span className="font-semibold uppercase tracking-wider opacity-80">
+          Kejadian:
+        </span>
         <span className="font-bold">{event.title}</span>
       </div>
       {choiceLabel && (
         <div className="mt-0.5 text-[11px] opacity-80">{choiceLabel}</div>
       )}
-    </div>
-  );
-}
-
-function Summary({ label, value, tone, big = false, hint }) {
-  const tones = {
-    emerald: 'text-emerald-300',
-    amber: 'text-amber-300',
-    rose: 'text-rose-300',
-    sky: 'text-sky-300',
-  };
-  return (
-    <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
-      <div className="text-[10px] font-semibold uppercase tracking-wider text-white/45">
-        {label}
-      </div>
-      <div className={`mt-0.5 font-display font-bold ${tones[tone]} ${big ? 'text-lg' : 'text-sm'}`}>
-        {value}
-      </div>
-      {hint && <div className="mt-0.5 text-[10px] text-white/40">{hint}</div>}
     </div>
   );
 }
@@ -201,11 +364,10 @@ function ReportRow({ row }) {
       </div>
 
       <div className="mt-1 text-[12px] text-white/60">
-        {row.routeLabel} · {row.distanceKm} km · {row.passengers}/{row.capacity} kursi (
-        {formatPercent(row.occupancy)})
+        {row.routeLabel} · {row.distanceKm} km · {row.passengers}/{row.capacity}{' '}
+        kursi ({formatPercent(row.occupancy)})
       </div>
 
-      {/* Crew + meters */}
       <div className="mt-2 grid gap-2 text-[11px] sm:grid-cols-3">
         <Meter
           label={`Supir: ${row.driverName ?? '—'} (skill ${row.driverSkill ?? '-'})`}
@@ -222,7 +384,9 @@ function ReportRow({ row }) {
           color={row.conditionAfter < 40 ? 'text-amber-300' : 'text-emerald-300'}
         />
         <div className="rounded-lg border border-white/5 bg-black/30 px-2 py-1.5">
-          <div className="text-[10px] uppercase tracking-wider text-white/40">Kernet</div>
+          <div className="text-[10px] uppercase tracking-wider text-white/40">
+            Kernet
+          </div>
           <div className="text-xs font-bold text-white">
             {row.kernetName ? (
               <span className="text-orange-300">{row.kernetName}</span>
@@ -233,7 +397,6 @@ function ReportRow({ row }) {
         </div>
       </div>
 
-      {/* Money breakdown */}
       <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-5">
         <Cell label="Pendapatan" value={formatIDR(row.revenue)} tone="text-emerald-300" />
         <Cell label="BBM" value={formatIDR(row.fuelCost)} tone="text-rose-300" />
