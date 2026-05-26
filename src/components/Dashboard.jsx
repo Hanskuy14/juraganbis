@@ -8,10 +8,22 @@ import {
 } from '../data/busTypes';
 import { previewTripEconomics } from '../utils/economics';
 import { STAMINA_FLOOR_TO_DRIVE } from '../data/staff';
+import { loanDailyDeduction } from '../data/bank';
 import { formatIDR, formatIDRCompact, formatPercent } from '../utils/format';
 
 export default function Dashboard({ onTabChange }) {
-  const { state, routesById, driversById, kernetsById, beginDispatch } = useGame();
+  const {
+    state,
+    routesById,
+    driversById,
+    kernetsById,
+    beginDispatch,
+    ranking,
+    REPUTATION_MAX,
+    PAILIT_GRACE_DAYS,
+  } = useGame();
+  const playerEntry = ranking.find((e) => e.isPlayer);
+  const nextLoanDeduction = loanDailyDeduction(state.loan);
 
   // Compute per-bus readiness + economic preview.
   const fleetView = useMemo(() => {
@@ -49,10 +61,29 @@ export default function Dashboard({ onTabChange }) {
     );
   }, [fleetView]);
 
-  const canDispatch = state.fleet.length > 0;
+  const canDispatch = state.fleet.length > 0 && !state.gameOver;
 
   return (
     <div className="space-y-6">
+      {/* Pailit warning */}
+      {state.daysInDebt > 0 && !state.gameOver && (
+        <div className="glass-panel flex items-start gap-3 border-rose-400/30 bg-rose-500/[0.06] p-4">
+          <div className="text-3xl">⚠️</div>
+          <div className="flex-1">
+            <div className="font-display text-sm font-bold text-rose-200">
+              Saldo PO sudah {state.daysInDebt} hari minus
+            </div>
+            <div className="text-xs text-rose-100/80">
+              Lunasi cicilan / kurangi pengeluaran. Pailit otomatis bila{' '}
+              {PAILIT_GRACE_DAYS} hari berturut-turut minus.
+            </div>
+          </div>
+          <button onClick={() => onTabChange('bank')} className="btn-secondary text-xs">
+            Buka Bank
+          </button>
+        </div>
+      )}
+
       {/* TikTok boost banner */}
       {state.tiktokBoostDaysLeft > 0 && (
         <div className="glass-panel flex items-center gap-3 border-fuchsia-400/30 bg-fuchsia-500/5 p-4">
@@ -68,6 +99,27 @@ export default function Dashboard({ onTabChange }) {
           <span className="pill border-fuchsia-400/30 bg-fuchsia-500/15 text-fuchsia-200">
             {state.tiktokBoostDaysLeft} hari
           </span>
+        </div>
+      )}
+
+      {/* Loan deduction banner */}
+      {state.loan && (
+        <div className="glass-panel flex flex-wrap items-center gap-3 border-amber-400/30 bg-amber-500/[0.05] p-4">
+          <div className="text-3xl">💰</div>
+          <div className="flex-1">
+            <div className="font-display text-sm font-bold text-amber-200">
+              Cicilan kredit aktif: sisa {formatIDR(state.loan.remaining)}
+            </div>
+            <div className="text-xs text-white/65">
+              Berangkat berikutnya akan dipotong{' '}
+              <span className="text-amber-300">{formatIDR(nextLoanDeduction.total)}</span>{' '}
+              ({formatIDRCompact(nextLoanDeduction.installment)} pokok +{' '}
+              {formatIDRCompact(nextLoanDeduction.interest)} bunga).
+            </div>
+          </div>
+          <button onClick={() => onTabChange('bank')} className="btn-secondary text-xs">
+            Lihat Pinjaman
+          </button>
         </div>
       )}
 
@@ -113,7 +165,7 @@ export default function Dashboard({ onTabChange }) {
         </div>
 
         {/* Preview totals */}
-        <div className="relative mt-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <div className="relative mt-5 grid grid-cols-2 gap-2 sm:grid-cols-5">
           <PreviewStat
             label="Estimasi Pendapatan"
             value={formatIDRCompact(totalsPreview.revenue)}
@@ -131,6 +183,16 @@ export default function Dashboard({ onTabChange }) {
             value={formatIDRCompact(totalsPreview.profit)}
             tone={totalsPreview.profit >= 0 ? 'amber' : 'rose'}
             hint="Sebelum gaji & kejadian"
+          />
+          <PreviewStat
+            label="Reputasi"
+            value={`${state.reputation}/${REPUTATION_MAX}`}
+            tone="fuchsia"
+            hint={
+              playerEntry
+                ? `Rank #${playerEntry.rank} dari ${ranking.length}`
+                : 'Lihat leaderboard'
+            }
           />
           <PreviewStat
             label="Saldo Sekarang"
@@ -200,6 +262,7 @@ function PreviewStat({ label, value, hint, tone = 'sky' }) {
     rose: 'text-rose-300',
     amber: 'text-amber-300',
     sky: 'text-sky-300',
+    fuchsia: 'text-fuchsia-300',
   };
   return (
     <div className="glass-card flex flex-col px-4 py-3">

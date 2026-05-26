@@ -14,8 +14,15 @@ import { STAMINA_FLOOR_TO_DRIVE } from '../data/staff';
 import { formatIDR, formatIDRCompact, formatPercent } from '../utils/format';
 
 export default function Garasi({ onTabChange }) {
-  const { state, routesById, driversById, kernetsById, unassignRoute, sellBus } =
-    useGame();
+  const {
+    state,
+    routesById,
+    driversById,
+    kernetsById,
+    unassignRoute,
+    sellBus,
+    garageCap,
+  } = useGame();
   const [editing, setEditing] = useState(null); // bus object
   const [crewEditing, setCrewEditing] = useState(null); // bus object
   const [confirmSell, setConfirmSell] = useState(null); // bus.id
@@ -46,6 +53,9 @@ export default function Garasi({ onTabChange }) {
             Atur trayek <span className="text-white/85">dan</span> kru (supir + kernet)
             sebelum berangkat.
           </p>
+          <p className="mt-1 text-[11px] text-white/45">
+            Kapasitas: {state.fleet.length}/{garageCap} unit · upgrade di tab Aset.
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button onClick={() => onTabChange('hr')} className="btn-secondary text-xs">
@@ -54,7 +64,14 @@ export default function Garasi({ onTabChange }) {
           <button onClick={() => onTabChange('bengkel')} className="btn-secondary text-xs">
             🛠️ Bengkel
           </button>
-          <button onClick={() => onTabChange('dealer')} className="btn-ghost text-xs">
+          <button onClick={() => onTabChange('aset')} className="btn-ghost text-xs">
+            🏗️ Aset
+          </button>
+          <button
+            onClick={() => onTabChange('dealer')}
+            disabled={state.fleet.length >= garageCap}
+            className="btn-ghost text-xs disabled:cursor-not-allowed disabled:opacity-40"
+          >
             + Tambah unit
           </button>
         </div>
