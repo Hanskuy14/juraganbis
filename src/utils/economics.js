@@ -49,10 +49,20 @@ export function expectedOccupancy(strategyId) {
 }
 
 // Rolled-up preview the dashboard shows for a bus assigned to a route.
-export function previewTripEconomics({ busType, distanceKm, strategyId }) {
+// `occupancyOverride` lets the caller plug in a visibility-driven occupancy
+// (Part 2 marketing engine). When omitted we fall back to the strategy
+// midpoint — same behavior as the legacy preview.
+export function previewTripEconomics({
+  busType,
+  distanceKm,
+  strategyId,
+  occupancyOverride,
+}) {
   const fuel = calculateFuelCost(busType.id, distanceKm);
   const ticketPrice = calculateTicketPrice(busType.id, distanceKm, strategyId);
-  const occ = expectedOccupancy(strategyId);
+  const occ = typeof occupancyOverride === 'number'
+    ? occupancyOverride
+    : expectedOccupancy(strategyId);
   const expectedPassengers = Math.round(busType.capacity * occ);
   const expectedRevenue = ticketPrice * expectedPassengers;
   const expectedProfit = expectedRevenue - fuel.cost;
@@ -271,6 +281,192 @@ export function resolveBusTrip(bus, route, ctx = {}) {
     kernetId: kernet?.id ?? null,
     kernetName: kernet?.name ?? null,
     breakdown,
+    eventNotes,
+    idle: false,
+  };
+}
+
+// --- Telemetry-driven dispatch -------------------------------------------
+
+// Resolve a single bus's trip given a finished telemetry frame.
+// This mirrors `resolveBusTrip` but the breakdown decision comes from the
+// real-time engine (overheat or blowout) instead of a dice roll.
+//
+// `frame` is the final shape from utils/telemetry.js.
+export function resolveTelemetryTrip(bus, route, frame, ctx = {}) {
+  const busType = getBusType(bus.class);
+  const {
+    driver = null,
+    kernet = null,
+    event = null,
+    tiktokBoostActive = false,
+  } = ctx;
+
+  if (!busType || !route || !driver) {
+    return null;
+  }
+
+  const distanceKm = route.distanceKm;
+  const fuelLiters = frame.fuelStarted;
+  const ticketPrice = calculateTicketPrice(busType.id, distanceKm, route.strategy);
+
+  // E-Ticketing visibility-driven occupancy: the score was locked at
+  // dispatch time on the telemetry frame. We trust it here so the player
+  // sees exactly the occupancy they were promised in the dashboard.
+  // Fallback to the random roll for safety on legacy frames.
+  let occupancy = typeof frame.expectedOccupancy === 'number'
+    ? frame.expectedOccupancy
+    : rollOccupancy(route.strategy);
+  if (tiktokBoostActive && typeof frame.expectedOccupancy !== 'number') {
+    // Only legacy fallback path applies the bump — the new flow already
+    // factored TikTok into the visibility score.
+    occupancy = Math.min(1, occupancy * 1.3);
+  }
+
+  let revenueMultiplier = 1;
+  let fuelMultiplier = frame.extraFuelMult ?? 1;
+  let extraExpense = 0;
+  const eventNotes = [];
+
+  // Visibility tier note for the report.
+  if (frame.visibilityTier) {
+    if (frame.visibilityTier === 'top') {
+      eventNotes.push(`📈 Visibility ${frame.visibilityScore}/100 — bus tampil di Top Page 1.`);
+    } else if (frame.visibilityTier === 'ghost') {
+      eventNotes.push(`👻 Visibility ${frame.visibilityScore}/100 — bus jadi Ghost Bus, hampir kosong.`);
+    } else {
+      eventNotes.push(`Visibility ${frame.visibilityScore}/100 (${frame.visibilityTier}).`);
+    }
+  }
+
+  // Weather + intervention effects.
+  if (frame.weather === 'badai') {
+    eventNotes.push('⛈️ Hujan Badai mid-trip.');
+  }
+  if (frame.usedSlowDown) {
+    eventNotes.push('📻 Radio Supir: kurangi kecepatan (telat, BBM boros).');
+  }
+  if (frame.usedEmergencyPitstop) {
+    eventNotes.push('🛞 Emergency pitstop: ganti ban di rest area (-1 ban).');
+  }
+  if ((frame.satisfactionPenalty ?? 0) > 0) {
+    revenueMultiplier *= 1 - frame.satisfactionPenalty;
+  }
+
+  if (event) {
+    if (event.id === 'razia') {
+      if (event.choice === 'bribe') {
+        extraExpense += 500_000;
+        eventNotes.push('Razia: bayar uang kopi Rp 500.000');
+      } else if (event.choice === 'refuse') {
+        extraExpense += 2_000_000;
+        revenueMultiplier *= 0.7;
+        eventNotes.push('Razia: kena denda Rp 2.000.000 + telat');
+      }
+    } else if (event.id === 'macet') {
+      fuelMultiplier *= 1.5;
+      revenueMultiplier *= 0.85;
+      eventNotes.push('Macet Tol Cikampek: BBM +50%, kepuasan turun');
+    } else if (event.id === 'tiktok') {
+      eventNotes.push('Viral di TikTok: demand naik 30%');
+    }
+  }
+
+  const passengers = Math.round(busType.capacity * occupancy);
+  const baseRevenue = ticketPrice * passengers;
+  let revenue = Math.round(baseRevenue * revenueMultiplier);
+
+  if (kernet) revenue += KERNET_PENUMPANG_GELAP_BONUS;
+
+  // Fuel expense is now zero in cash terms (already paid via inventory),
+  // but we keep the report fields populated for the daily report UI.
+  const fuelLitersFinal = Math.round(fuelLiters * fuelMultiplier);
+  const fuelCost = 0; // legacy field retained for compatibility
+
+  const driverSalary = driverTripSalary(driver.skill ?? 5);
+  const kernetSalary = kernet ? kernet.salary ?? 75_000 : 0;
+  const salaries = driverSalary + kernetSalary;
+
+  const conditionBefore = frame.conditionStart;
+  let damage = calculateConditionDamage({
+    distanceKm,
+    busType,
+    driverSkill: driver.skill ?? 5,
+    hasKernet: Boolean(kernet),
+  });
+
+  let breakdown = false;
+  let repairFine = 0;
+  if (frame.breakdown) {
+    breakdown = true;
+    // Crashes are catastrophic — double the standard breakdown fine.
+    const isCrash = frame.breakdownReason === 'crash' || frame.crashed;
+    repairFine = isCrash ? BREAKDOWN_FINE * 2 : BREAKDOWN_FINE;
+    revenue = 0;
+    if (isCrash) {
+      damage = Math.max(damage, 65);
+    } else {
+      damage = Math.max(damage, frame.breakdownReason === 'overheat' ? 45 : 30);
+    }
+    if (isCrash) {
+      eventNotes.push('💥 KECELAKAAN! Bus tabrakan saat hujan badai. Reputasi PO anjlok.');
+    } else if (frame.breakdownReason === 'overheat') {
+      eventNotes.push('🔥 Mesin overheat di tengah jalan! Pendapatan 0, denda perbaikan.');
+    } else if (frame.breakdownReason === 'blowout') {
+      eventNotes.push('💥 Ban meledak! Trip gagal, denda perbaikan.');
+    } else {
+      eventNotes.push('🛠 MOGOK di tengah jalan! Pendapatan 0, denda perbaikan.');
+    }
+  }
+
+  const conditionAfter = Math.max(0, conditionBefore - damage);
+
+  const staminaBefore = driver.stamina ?? 100;
+  const drain = staminaDrainForTrip(distanceKm, driver.skill ?? 5);
+  const staminaAfter = Math.max(0, staminaBefore - drain);
+
+  const profit = revenue - fuelCost - salaries - extraExpense - repairFine;
+
+  return {
+    busId: bus.id,
+    busName: bus.name,
+    busClass: busType.class,
+    capacity: busType.capacity,
+    routeId: route.id,
+    routeLabel: `${route.fromName} → ${route.toName}`,
+    strategy: route.strategy,
+    distanceKm,
+    fuelLiters: fuelLitersFinal,
+    fuelCost,
+    ticketPrice,
+    occupancy,
+    passengers,
+    revenue,
+    salaries,
+    extraExpense,
+    repairFine,
+    profit,
+    conditionBefore,
+    conditionAfter,
+    conditionDamage: damage,
+    staminaBefore,
+    staminaAfter,
+    driverId: driver.id,
+    driverName: driver.name,
+    driverSkill: driver.skill,
+    kernetId: kernet?.id ?? null,
+    kernetName: kernet?.name ?? null,
+    breakdown,
+    breakdownReason: frame.breakdownReason ?? null,
+    crashed: Boolean(frame.crashed),
+    finalEngineTemp: Math.round(frame.engineTemp),
+    finalTireWear: Math.round(frame.tireWear),
+    visibilityScore: frame.visibilityScore ?? null,
+    visibilityTier: frame.visibilityTier ?? null,
+    marketingBudget: frame.marketingBudget ?? 0,
+    weather: frame.weather ?? 'cerah',
+    usedSlowDown: Boolean(frame.usedSlowDown),
+    usedEmergencyPitstop: Boolean(frame.usedEmergencyPitstop),
     eventNotes,
     idle: false,
   };

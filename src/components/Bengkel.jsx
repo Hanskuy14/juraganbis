@@ -5,15 +5,10 @@ import {
   CONDITION_NEEDS_SERVICE,
   CONDITION_BREAKDOWN_RISK,
 } from '../data/busTypes';
-import {
-  INTERNAL_MECHANIC_DISCOUNT,
-  discountedRepairCost,
-} from '../data/upgrades';
 import { formatIDR } from '../utils/format';
 
 export default function Bengkel({ onTabChange }) {
   const { state, repairBus } = useGame();
-  const hasInternalMechanic = state.upgrades.internalMechanic;
 
   if (state.fleet.length === 0) {
     return (
@@ -43,12 +38,6 @@ export default function Bengkel({ onTabChange }) {
             Servis bus untuk mengembalikan kondisi ke 100%. Bus yang masuk bengkel
             <span className="text-amber-300"> tidak bisa berangkat hari ini</span>.
           </p>
-          {hasInternalMechanic && (
-            <p className="mt-1 text-xs text-emerald-300">
-              🔧 Fasilitas Montir Internal aktif — diskon{' '}
-              {Math.round(INTERNAL_MECHANIC_DISCOUNT * 100)}% di semua servis.
-            </p>
-          )}
         </div>
         <div className="flex items-center gap-2">
           <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-right">
@@ -71,7 +60,6 @@ export default function Bengkel({ onTabChange }) {
             key={bus.id}
             bus={bus}
             balance={state.balance}
-            hasInternalMechanic={hasInternalMechanic}
             onRepair={() => repairBus(bus.id)}
           />
         ))}
@@ -111,13 +99,11 @@ function LegendChip({ label, hint, tone }) {
   );
 }
 
-function RepairCard({ bus, balance, hasInternalMechanic, onRepair }) {
+function RepairCard({ bus, balance, onRepair }) {
   const busType = getBusType(bus.class);
   const condition = bus.condition ?? CONDITION_MAX;
   const points = CONDITION_MAX - condition;
-  const rawCost = points * (busType?.repairCostPerPoint ?? 200_000);
-  const cost = discountedRepairCost(rawCost, hasInternalMechanic);
-  const discountSaved = rawCost - cost;
+  const cost = points * (busType?.repairCostPerPoint ?? 200_000);
   const canAfford = balance >= cost && points > 0;
   const status = conditionStatus(condition);
 
@@ -155,12 +141,7 @@ function RepairCard({ bus, balance, hasInternalMechanic, onRepair }) {
 
       <div className="mt-3 grid grid-cols-3 gap-1.5 text-center">
         <Cell label="Poin rusak" value={`${points}`} tone={points > 0 ? 'text-rose-300' : 'text-white/60'} />
-        <Cell
-          label="Biaya servis"
-          value={formatIDR(cost)}
-          tone="text-amber-300"
-          hint={discountSaved > 0 ? `−${formatIDR(discountSaved)} montir internal` : null}
-        />
+        <Cell label="Biaya servis" value={formatIDR(cost)} tone="text-amber-300" />
         <Cell
           label="Status hari ini"
           value={bus.inWorkshop ? 'Di bengkel' : 'Siap servis'}
@@ -191,12 +172,11 @@ function RepairCard({ bus, balance, hasInternalMechanic, onRepair }) {
   );
 }
 
-function Cell({ label, value, tone = 'text-white', hint }) {
+function Cell({ label, value, tone = 'text-white' }) {
   return (
     <div className="rounded-lg border border-white/5 bg-black/30 px-2 py-1.5">
       <div className="text-[10px] uppercase tracking-wider text-white/40">{label}</div>
       <div className={`text-xs font-bold ${tone}`}>{value}</div>
-      {hint && <div className="mt-0.5 text-[10px] text-emerald-300/80">{hint}</div>}
     </div>
   );
 }
