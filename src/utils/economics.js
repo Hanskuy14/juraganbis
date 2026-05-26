@@ -276,6 +276,142 @@ export function resolveBusTrip(bus, route, ctx = {}) {
   };
 }
 
+// --- Telemetry-driven dispatch -------------------------------------------
+
+// Resolve a single bus's trip given a finished telemetry frame.
+// This mirrors `resolveBusTrip` but the breakdown decision comes from the
+// real-time engine (overheat or blowout) instead of a dice roll.
+//
+// `frame` is the final shape from utils/telemetry.js.
+export function resolveTelemetryTrip(bus, route, frame, ctx = {}) {
+  const busType = getBusType(bus.class);
+  const {
+    driver = null,
+    kernet = null,
+    event = null,
+    tiktokBoostActive = false,
+  } = ctx;
+
+  if (!busType || !route || !driver) {
+    return null;
+  }
+
+  const distanceKm = route.distanceKm;
+  const fuelLiters = frame.fuelStarted;
+  const ticketPrice = calculateTicketPrice(busType.id, distanceKm, route.strategy);
+
+  let occupancy = rollOccupancy(route.strategy);
+  if (tiktokBoostActive) occupancy = Math.min(1, occupancy * 1.3);
+
+  let revenueMultiplier = 1;
+  let fuelMultiplier = 1;        // kept for symmetry with resolveBusTrip
+  let extraExpense = 0;
+  const eventNotes = [];
+
+  if (event) {
+    if (event.id === 'razia') {
+      if (event.choice === 'bribe') {
+        extraExpense += 500_000;
+        eventNotes.push('Razia: bayar uang kopi Rp 500.000');
+      } else if (event.choice === 'refuse') {
+        extraExpense += 2_000_000;
+        revenueMultiplier *= 0.7;
+        eventNotes.push('Razia: kena denda Rp 2.000.000 + telat');
+      }
+    } else if (event.id === 'macet') {
+      fuelMultiplier *= 1.5;
+      revenueMultiplier *= 0.85;
+      eventNotes.push('Macet Tol Cikampek: BBM +50%, kepuasan turun');
+    } else if (event.id === 'tiktok') {
+      eventNotes.push('Viral di TikTok: demand naik 30%');
+    }
+  }
+
+  const passengers = Math.round(busType.capacity * occupancy);
+  const baseRevenue = ticketPrice * passengers;
+  let revenue = Math.round(baseRevenue * revenueMultiplier);
+
+  if (kernet) revenue += KERNET_PENUMPANG_GELAP_BONUS;
+
+  // Fuel expense is now zero in cash terms (already paid via inventory),
+  // but we keep the report fields populated for the daily report UI.
+  const fuelLitersFinal = Math.round(fuelLiters * fuelMultiplier);
+  const fuelCost = 0; // legacy field retained for compatibility
+
+  const driverSalary = driverTripSalary(driver.skill ?? 5);
+  const kernetSalary = kernet ? kernet.salary ?? 75_000 : 0;
+  const salaries = driverSalary + kernetSalary;
+
+  const conditionBefore = frame.conditionStart;
+  let damage = calculateConditionDamage({
+    distanceKm,
+    busType,
+    driverSkill: driver.skill ?? 5,
+    hasKernet: Boolean(kernet),
+  });
+
+  let breakdown = false;
+  let repairFine = 0;
+  if (frame.breakdown) {
+    breakdown = true;
+    repairFine = BREAKDOWN_FINE;
+    revenue = 0;
+    damage = Math.max(damage, frame.breakdownReason === 'overheat' ? 45 : 30);
+    if (frame.breakdownReason === 'overheat') {
+      eventNotes.push('🔥 Mesin overheat di tengah jalan! Pendapatan 0, denda perbaikan.');
+    } else if (frame.breakdownReason === 'blowout') {
+      eventNotes.push('💥 Ban meledak! Trip gagal, denda perbaikan.');
+    } else {
+      eventNotes.push('🛠 MOGOK di tengah jalan! Pendapatan 0, denda perbaikan.');
+    }
+  }
+
+  const conditionAfter = Math.max(0, conditionBefore - damage);
+
+  const staminaBefore = driver.stamina ?? 100;
+  const drain = staminaDrainForTrip(distanceKm, driver.skill ?? 5);
+  const staminaAfter = Math.max(0, staminaBefore - drain);
+
+  const profit = revenue - fuelCost - salaries - extraExpense - repairFine;
+
+  return {
+    busId: bus.id,
+    busName: bus.name,
+    busClass: busType.class,
+    capacity: busType.capacity,
+    routeId: route.id,
+    routeLabel: `${route.fromName} → ${route.toName}`,
+    strategy: route.strategy,
+    distanceKm,
+    fuelLiters: fuelLitersFinal,
+    fuelCost,
+    ticketPrice,
+    occupancy,
+    passengers,
+    revenue,
+    salaries,
+    extraExpense,
+    repairFine,
+    profit,
+    conditionBefore,
+    conditionAfter,
+    conditionDamage: damage,
+    staminaBefore,
+    staminaAfter,
+    driverId: driver.id,
+    driverName: driver.name,
+    driverSkill: driver.skill,
+    kernetId: kernet?.id ?? null,
+    kernetName: kernet?.name ?? null,
+    breakdown,
+    breakdownReason: frame.breakdownReason ?? null,
+    finalEngineTemp: Math.round(frame.engineTemp),
+    finalTireWear: Math.round(frame.tireWear),
+    eventNotes,
+    idle: false,
+  };
+}
+
 // Aggregate totals for the daily report modal.
 export function summarizeReport(rows) {
   return rows.reduce(

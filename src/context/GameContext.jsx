@@ -13,7 +13,7 @@ import { getBusType, CONDITION_MAX } from '../data/busTypes';
 import { getCity } from '../data/cities';
 import { getDistance } from '../data/distanceMatrix';
 import {
-  resolveBusTrip,
+  resolveTelemetryTrip,
   summarizeReport,
   rollRoadEvent,
 } from '../utils/economics';
@@ -24,28 +24,47 @@ import {
   STAMINA_REST_REGEN,
   driverTripSalary,
 } from '../data/staff';
+import {
+  ASSETS,
+  STARTING_INVENTORY,
+  initialMarketState,
+  tickMarket,
+  addInventory,
+  deductInventory,
+} from '../utils/market';
+import {
+  buildDispatchPlan,
+  tickAllTelemetry,
+  isAllSettled,
+} from '../utils/telemetry';
 
 const STARTING_CAPITAL = 800_000_000;
 
 // --- Initial / empty state ------------------------------------------------
 
-const emptyState = () => ({
-  poName: '',
-  day: 1,
-  balance: STARTING_CAPITAL,
-  fleet: [],            // { id, name, class, capacity, fuelEfficiency, condition,
-                        //   inWorkshop, assignedRoute, assignedDriverId, assignedKernetId }
-  routes: [],           // { id, fromId, fromName, toId, toName, distanceKm, strategy }
-  drivers: [],          // { id, name, skill, stamina, salary, assignedBusId }
-  kernets: [],          // { id, name, salary, assignedBusId }
-  lastReport: null,     // { day, rows, totals }
-  pendingDispatch: null, // staged trips awaiting event choice
-  pendingEvent: null,   // road event needing user resolution / acknowledgement
-  tiktokBoostDaysLeft: 0,
-  createdAt: null,
-});
+const emptyState = () => {
+  const market = initialMarketState();
+  return {
+    poName: '',
+    day: 1,
+    balance: STARTING_CAPITAL,
+    fleet: [],
+    routes: [],
+    drivers: [],
+    kernets: [],
+    lastReport: null,
+    pendingDispatch: null,    // staged plan awaiting event choice
+    pendingEvent: null,
+    activeTrip: null,         // running telemetry session
+    tiktokBoostDaysLeft: 0,
+    inventory: { ...STARTING_INVENTORY },
+    marketPrices: market.marketPrices,
+    priceHistory: market.priceHistory,
+    createdAt: null,
+  };
+};
 
-// Backfill new Phase 2 fields onto saves from Phase 1.
+// Backfill new Phase 2 / 3 fields onto saves from older versions.
 function migrateSave(saved) {
   if (!saved) return saved;
   const base = emptyState();
@@ -62,6 +81,15 @@ function migrateSave(saved) {
   merged.tiktokBoostDaysLeft = saved.tiktokBoostDaysLeft ?? 0;
   merged.pendingDispatch = saved.pendingDispatch ?? null;
   merged.pendingEvent = saved.pendingEvent ?? null;
+  merged.activeTrip = null; // never persist a live telemetry session
+  merged.inventory = { ...base.inventory, ...(saved.inventory ?? {}) };
+  if (!saved.marketPrices || !saved.priceHistory) {
+    merged.marketPrices = base.marketPrices;
+    merged.priceHistory = base.priceHistory;
+  } else {
+    merged.marketPrices = saved.marketPrices;
+    merged.priceHistory = saved.priceHistory;
+  }
   return merged;
 }
 
@@ -71,48 +99,67 @@ function unassignFromAllBuses(fleet, idKey, staffId) {
   return fleet.map((b) => (b[idKey] === staffId ? { ...b, [idKey]: null } : b));
 }
 
-// Build the actual trip rows + totals from state. Used by both
-// COMMIT_DISPATCH (no event) and RESOLVE_EVENT.
-function executeDispatch(state, event) {
+// Given an active telemetry session and the legacy event payload, finalize
+// the day: produce the daily report, apply per-bus / per-driver state
+// changes, deduct inventory, and tick the market for tomorrow.
+function finalizeFromTelemetry(state) {
+  const session = state.activeTrip;
+  if (!session) return state;
+
   const routesById = Object.fromEntries(state.routes.map((r) => [r.id, r]));
   const driversById = Object.fromEntries(state.drivers.map((d) => [d.id, d]));
   const kernetsById = Object.fromEntries(state.kernets.map((k) => [k.id, k]));
   const tiktokBoostActive = state.tiktokBoostDaysLeft > 0;
 
-  const rows = state.fleet.map((bus) =>
-    resolveBusTrip(
-      bus,
-      bus.assignedRoute ? routesById[bus.assignedRoute] : null,
-      {
-        driver: bus.assignedDriverId ? driversById[bus.assignedDriverId] : null,
-        kernet: bus.assignedKernetId ? kernetsById[bus.assignedKernetId] : null,
-        event,
+  // Resolve every dispatched bus into a report row using the telemetry
+  // outcome (overheat / blowout overrides the random condition roll).
+  const tripRows = session.frames
+    .map((frame) => {
+      const bus = state.fleet.find((b) => b.id === frame.busId);
+      if (!bus) return null;
+      const route = routesById[frame.routeId];
+      if (!route) return null;
+      const driver = bus.assignedDriverId ? driversById[bus.assignedDriverId] : null;
+      const kernet = bus.assignedKernetId ? kernetsById[bus.assignedKernetId] : null;
+      return resolveTelemetryTrip(bus, route, frame, {
+        driver,
+        kernet,
+        event: session.event,
         tiktokBoostActive,
-      }
-    )
-  );
+      });
+    })
+    .filter(Boolean);
+
+  const rows = [...tripRows, ...session.idleRows];
   const totals = summarizeReport(rows);
 
-  // Apply per-row state changes back onto fleet & drivers.
+  // Apply fleet condition + driver stamina changes.
   const fleet = state.fleet.map((bus) => {
     const row = rows.find((r) => r.busId === bus.id);
     if (!row || row.idle) return bus;
     return { ...bus, condition: row.conditionAfter };
   });
-
   const drivers = state.drivers.map((d) => {
     const row = rows.find((r) => r.driverId === d.id);
     if (row && !row.idle) {
       return { ...d, stamina: row.staminaAfter };
     }
-    // Drivers who didn't drive today -> rest regen.
-    return { ...d, stamina: Math.min(STAMINA_MAX, (d.stamina ?? 0) + STAMINA_REST_REGEN) };
+    return {
+      ...d,
+      stamina: Math.min(STAMINA_MAX, (d.stamina ?? 0) + STAMINA_REST_REGEN),
+    };
   });
 
-  // TikTok timer: tick down each day, but if THIS dispatch triggered tiktok,
-  // refresh to 3 days starting next day.
+  // Inventory: pre-paid resources were already earmarked in the plan via
+  // session.totalCost. Deduct now (broken-down buses still burn fuel/tires).
+  const inventory = deductInventory(state.inventory, session.totalCost);
+
+  // Market: tick to tomorrow's prices.
+  const next = tickMarket(state.marketPrices, state.priceHistory);
+
+  // TikTok timer.
   let tiktokBoostDaysLeft = Math.max(0, state.tiktokBoostDaysLeft - 1);
-  if (event?.id === 'tiktok') tiktokBoostDaysLeft = 3;
+  if (session.event?.id === 'tiktok') tiktokBoostDaysLeft = 3;
 
   return {
     ...state,
@@ -120,14 +167,19 @@ function executeDispatch(state, event) {
     balance: state.balance + totals.profit,
     fleet,
     drivers,
+    inventory,
+    marketPrices: next.marketPrices,
+    priceHistory: next.priceHistory,
     tiktokBoostDaysLeft,
     pendingDispatch: null,
     pendingEvent: null,
+    activeTrip: null,
     lastReport: {
       day: state.day,
       rows,
       totals,
-      event,
+      event: session.event,
+      resourcesUsed: session.totalCost,
       timestamp: Date.now(),
     },
   };
@@ -158,7 +210,6 @@ function reducer(state, action) {
       const bt = getBusType(busTypeId);
       if (!bt) return state;
       if (state.balance < bt.price) return state;
-
       const ordinal = state.fleet.length + 1;
       const fallbackName = `${bt.name.split(' / ')[0]} #${String(ordinal).padStart(2, '0')}`;
       const newBus = {
@@ -184,18 +235,14 @@ function reducer(state, action) {
       const bus = state.fleet.find((b) => b.id === action.busId);
       if (!bus) return state;
       const bt = getBusType(bus.class);
-      // Refund scales with condition: full 60% only at 100% condition.
       const conditionFactor = (bus.condition ?? 100) / 100;
       const refund = Math.round((bt?.price ?? 0) * 0.6 * conditionFactor);
-
-      // Free up the assigned crew.
       const drivers = state.drivers.map((d) =>
         d.assignedBusId === bus.id ? { ...d, assignedBusId: null } : d
       );
       const kernets = state.kernets.map((k) =>
         k.assignedBusId === bus.id ? { ...k, assignedBusId: null } : k
       );
-
       return {
         ...state,
         balance: state.balance + refund,
@@ -214,7 +261,6 @@ function reducer(state, action) {
       if (!from || !to || from.id === to.id) return state;
       const distanceKm = getDistance(from.id, to.id);
       if (!distanceKm) return state;
-
       const existing = state.routes.find(
         (r) => r.fromId === from.id && r.toId === to.id && r.strategy === strategy
       );
@@ -227,7 +273,6 @@ function reducer(state, action) {
         distanceKm,
         strategy,
       };
-
       const routes = existing ? state.routes : [...state.routes, route];
       const fleet = state.fleet.map((b) =>
         b.id === busId ? { ...b, assignedRoute: route.id } : b
@@ -297,7 +342,6 @@ function reducer(state, action) {
 
     case 'ASSIGN_DRIVER': {
       const { busId, driverId } = action;
-      // Detach driverId from any bus that had it; attach to busId.
       const fleet = state.fleet.map((b) => {
         if (b.id === busId) return { ...b, assignedDriverId: driverId };
         if (b.assignedDriverId === driverId) return { ...b, assignedDriverId: null };
@@ -365,42 +409,158 @@ function reducer(state, action) {
       if (points <= 0) return state;
       const cost = points * (bt?.repairCostPerPoint ?? 200_000);
       if (state.balance < cost) return state;
+      // Workshop service ALSO consumes 1 spare part if available — costs
+      // are still mostly cash to avoid making bengkel a hard inventory
+      // gate, but tactical players will care.
+      const inventory = (state.inventory.parts ?? 0) > 0
+        ? { ...state.inventory, parts: state.inventory.parts - 1 }
+        : state.inventory;
       const fleet = state.fleet.map((b) =>
         b.id === action.busId
           ? { ...b, condition: CONDITION_MAX, inWorkshop: true }
           : b
       );
-      return { ...state, balance: state.balance - cost, fleet };
+      return { ...state, balance: state.balance - cost, fleet, inventory };
+    }
+
+    // -- Market & Inventory ---------------------------------------------
+    case 'BUY_ASSET': {
+      const { assetId, quantity } = action;
+      const asset = ASSETS[assetId];
+      if (!asset || quantity <= 0) return state;
+      const price = state.marketPrices[assetId] ?? asset.basePrice;
+      const cost = price * quantity;
+      if (state.balance < cost) return state;
+      return {
+        ...state,
+        balance: state.balance - cost,
+        inventory: addInventory(state.inventory, { [assetId]: quantity }),
+      };
+    }
+
+    case 'SELL_ASSET': {
+      const { assetId, quantity } = action;
+      const asset = ASSETS[assetId];
+      if (!asset || quantity <= 0) return state;
+      if ((state.inventory[assetId] ?? 0) < quantity) return state;
+      // Sell-back at 90% of current market — small spread punishes flipping.
+      const price = state.marketPrices[assetId] ?? asset.basePrice;
+      const revenue = Math.round(price * quantity * 0.9);
+      return {
+        ...state,
+        balance: state.balance + revenue,
+        inventory: deductInventory(state.inventory, { [assetId]: quantity }),
+      };
     }
 
     // -- Dispatch flow ---------------------------------------------------
     case 'BEGIN_DISPATCH': {
-      // If a flow is already pending, ignore.
-      if (state.pendingEvent || state.pendingDispatch) return state;
+      if (state.pendingEvent || state.activeTrip) return state;
 
-      // Quick projection of which buses would actually go out, used by the
-      // event roller (e.g., to decide if "tiktok" is eligible).
+      const routesById = Object.fromEntries(state.routes.map((r) => [r.id, r]));
       const driversById = Object.fromEntries(state.drivers.map((d) => [d.id, d]));
-      const dispatchable = state.fleet
-        .filter((b) => b.assignedRoute && b.assignedDriverId && !b.inWorkshop)
-        .map((b) => {
-          const drv = driversById[b.assignedDriverId];
-          if (!drv || (drv.stamina ?? 0) < 20) return null;
-          return { busClass: b.class, driverSkill: drv?.skill ?? 0 };
-        })
-        .filter(Boolean);
+      const kernetsById = Object.fromEntries(state.kernets.map((k) => [k.id, k]));
 
-      const event = rollRoadEvent(dispatchable);
-      if (event) {
-        return { ...state, pendingEvent: event, pendingDispatch: { rolledAt: Date.now() } };
+      const plan = buildDispatchPlan({
+        fleet: state.fleet,
+        routesById,
+        driversById,
+        kernetsById,
+        inventory: state.inventory,
+      });
+
+      // No bus actually goes out today — emit an empty report immediately
+      // (otherwise the Telemetry modal would just be a "settled" dialog
+      // with nothing to watch).
+      if (plan.frames.length === 0) {
+        const totals = summarizeReport(plan.idleRows);
+        // Still tick the market — a day passes either way.
+        const next = tickMarket(state.marketPrices, state.priceHistory);
+        return {
+          ...state,
+          day: state.day + 1,
+          marketPrices: next.marketPrices,
+          priceHistory: next.priceHistory,
+          tiktokBoostDaysLeft: Math.max(0, state.tiktokBoostDaysLeft - 1),
+          drivers: state.drivers.map((d) => ({
+            ...d,
+            stamina: Math.min(STAMINA_MAX, (d.stamina ?? 0) + STAMINA_REST_REGEN),
+          })),
+          lastReport: {
+            day: state.day,
+            rows: plan.idleRows,
+            totals,
+            event: null,
+            resourcesUsed: { fuel: 0, tires: 0, parts: 0 },
+            timestamp: Date.now(),
+          },
+        };
       }
-      return executeDispatch(state, null);
+
+      // Project of dispatchable buses for the event roller.
+      const dispatchable = plan.frames.map((f) => ({
+        busClass: f.busClass,
+        driverSkill: f.driverSkill ?? 0,
+      }));
+      const event = rollRoadEvent(dispatchable);
+
+      if (event && event.requiresChoice) {
+        // Stash the plan; the telemetry session will start once the event
+        // modal is resolved.
+        return {
+          ...state,
+          pendingEvent: event,
+          pendingDispatch: { plan, rolledAt: Date.now() },
+        };
+      }
+
+      return {
+        ...state,
+        pendingEvent: null,
+        pendingDispatch: null,
+        activeTrip: {
+          frames: plan.frames,
+          idleRows: plan.idleRows,
+          totalCost: plan.totalCost,
+          event: event ?? null,
+          status: 'running',
+          startedAt: Date.now(),
+        },
+      };
     }
 
     case 'RESOLVE_EVENT': {
-      if (!state.pendingEvent) return state;
+      if (!state.pendingEvent || !state.pendingDispatch) return state;
       const event = { ...state.pendingEvent, choice: action.choice ?? null };
-      return executeDispatch(state, event);
+      const plan = state.pendingDispatch.plan;
+      return {
+        ...state,
+        pendingEvent: null,
+        pendingDispatch: null,
+        activeTrip: {
+          frames: plan.frames,
+          idleRows: plan.idleRows,
+          totalCost: plan.totalCost,
+          event,
+          status: 'running',
+          startedAt: Date.now(),
+        },
+      };
+    }
+
+    case 'TICK_TELEMETRY': {
+      if (!state.activeTrip || state.activeTrip.status !== 'running') return state;
+      const frames = tickAllTelemetry(state.activeTrip.frames);
+      const status = isAllSettled(frames) ? 'settled' : 'running';
+      return {
+        ...state,
+        activeTrip: { ...state.activeTrip, frames, status },
+      };
+    }
+
+    case 'FINALIZE_TELEMETRY': {
+      if (!state.activeTrip) return state;
+      return finalizeFromTelemetry(state);
     }
 
     case 'CLEAR_REPORT': {
@@ -435,7 +595,10 @@ export function GameProvider({ children }) {
   useEffect(() => {
     if (!hydrated) return;
     if (!state.poName) return;
-    writeSave(state);
+    // Persist everything EXCEPT the live telemetry session — refreshing the
+    // page mid-trip would put the reducer into an awkward state.
+    const { activeTrip: _ignored, ...persistable } = state;
+    writeSave(persistable);
   }, [state, hydrated]);
 
   const startNewGame = useCallback((poName) => {
@@ -460,31 +623,31 @@ export function GameProvider({ children }) {
   const buyBus = useCallback((busTypeId, customName) => {
     dispatch({ type: 'BUY_BUS', busTypeId, customName });
   }, []);
-
   const sellBus = useCallback((busId) => dispatch({ type: 'SELL_BUS', busId }), []);
-
   const assignRoute = useCallback((busId, fromId, toId, strategy) => {
     dispatch({ type: 'ASSIGN_ROUTE', busId, fromId, toId, strategy });
   }, []);
-
   const unassignRoute = useCallback((busId) => {
     dispatch({ type: 'UNASSIGN_ROUTE', busId });
   }, []);
 
   const beginDispatch = useCallback(() => dispatch({ type: 'BEGIN_DISPATCH' }), []);
-  const resolveEvent = useCallback((choice) =>
-    dispatch({ type: 'RESOLVE_EVENT', choice }), []);
+  const resolveEvent = useCallback(
+    (choice) => dispatch({ type: 'RESOLVE_EVENT', choice }),
+    []
+  );
+  const tickTelemetry = useCallback(() => dispatch({ type: 'TICK_TELEMETRY' }), []);
+  const finalizeTelemetry = useCallback(
+    () => dispatch({ type: 'FINALIZE_TELEMETRY' }),
+    []
+  );
   const clearReport = useCallback(() => dispatch({ type: 'CLEAR_REPORT' }), []);
 
   // HR
-  const hireDriver = useCallback((candidate) =>
-    dispatch({ type: 'HIRE_DRIVER', candidate }), []);
-  const fireDriver = useCallback((driverId) =>
-    dispatch({ type: 'FIRE_DRIVER', driverId }), []);
-  const hireKernet = useCallback((candidate) =>
-    dispatch({ type: 'HIRE_KERNET', candidate }), []);
-  const fireKernet = useCallback((kernetId) =>
-    dispatch({ type: 'FIRE_KERNET', kernetId }), []);
+  const hireDriver = useCallback((c) => dispatch({ type: 'HIRE_DRIVER', candidate: c }), []);
+  const fireDriver = useCallback((id) => dispatch({ type: 'FIRE_DRIVER', driverId: id }), []);
+  const hireKernet = useCallback((c) => dispatch({ type: 'HIRE_KERNET', candidate: c }), []);
+  const fireKernet = useCallback((id) => dispatch({ type: 'FIRE_KERNET', kernetId: id }), []);
   const assignDriver = useCallback((busId, driverId) =>
     dispatch({ type: 'ASSIGN_DRIVER', busId, driverId }), []);
   const unassignDriver = useCallback((busId) =>
@@ -496,6 +659,12 @@ export function GameProvider({ children }) {
 
   // Workshop
   const repairBus = useCallback((busId) => dispatch({ type: 'REPAIR_BUS', busId }), []);
+
+  // Market
+  const buyAsset = useCallback((assetId, quantity) =>
+    dispatch({ type: 'BUY_ASSET', assetId, quantity }), []);
+  const sellAsset = useCallback((assetId, quantity) =>
+    dispatch({ type: 'SELL_ASSET', assetId, quantity }), []);
 
   const routesById = useMemo(
     () => Object.fromEntries(state.routes.map((r) => [r.id, r])),
@@ -535,6 +704,8 @@ export function GameProvider({ children }) {
     unassignRoute,
     beginDispatch,
     resolveEvent,
+    tickTelemetry,
+    finalizeTelemetry,
     clearReport,
     hireDriver,
     fireDriver,
@@ -545,6 +716,8 @@ export function GameProvider({ children }) {
     assignKernet,
     unassignKernet,
     repairBus,
+    buyAsset,
+    sellAsset,
   };
 
   return <GameContext.Provider value={value}>{children}</GameContext.Provider>;

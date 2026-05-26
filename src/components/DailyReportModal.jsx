@@ -7,7 +7,7 @@ export default function DailyReportModal() {
   const report = state.lastReport;
   if (!report) return null;
 
-  const { day, rows, totals, event } = report;
+  const { day, rows, totals, event, resourcesUsed } = report;
   const dispatchedRows = rows.filter((r) => !r.idle);
   const idleRows = rows.filter((r) => r.idle);
   const profitable = totals.profit >= 0;
@@ -52,13 +52,22 @@ export default function DailyReportModal() {
 
           <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
             <Summary label="Pendapatan" value={formatIDR(totals.revenue)} tone="emerald" />
-            <Summary label="Biaya BBM" value={formatIDR(totals.fuelCost)} tone="rose" />
             <Summary label="Gaji Kru" value={formatIDR(totals.salaries)} tone="rose" />
             <Summary
               label="Lain-lain"
               value={formatIDR((totals.extraExpense || 0) + (totals.repairFine || 0))}
               tone="rose"
               hint={totals.repairFine > 0 ? 'termasuk denda mogok' : 'razia / lain-lain'}
+            />
+            <Summary
+              label="Stok Terpakai"
+              value={
+                resourcesUsed
+                  ? `${formatNumber(resourcesUsed.fuel)}L · ${resourcesUsed.tires}b · ${resourcesUsed.parts}p`
+                  : '—'
+              }
+              tone="amber"
+              hint="solar · ban · parts"
             />
             <Summary
               label="Profit Bersih"
@@ -236,7 +245,7 @@ function ReportRow({ row }) {
       {/* Money breakdown */}
       <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-5">
         <Cell label="Pendapatan" value={formatIDR(row.revenue)} tone="text-emerald-300" />
-        <Cell label="BBM" value={formatIDR(row.fuelCost)} tone="text-rose-300" />
+        <Cell label="Solar" value={`${formatNumber(row.fuelLiters)}L`} tone="text-rose-300" />
         <Cell label="Gaji" value={formatIDR(row.salaries)} tone="text-rose-300" />
         <Cell
           label="Lain-lain"
