@@ -8,12 +8,17 @@ const TABS = [
   { id: 'garasi', label: 'Garasi', icon: '🚌' },
   { id: 'hr', label: 'Kantor HR', icon: '🏢' },
   { id: 'bengkel', label: 'Bengkel', icon: '🛠️' },
+  { id: 'bank', label: 'Bank', icon: '💰' },
+  { id: 'aset', label: 'Aset', icon: '🏗️' },
+  { id: 'leaderboard', label: 'Persaingan', icon: '🏆' },
 ];
 
 export default function Topbar({ activeTab, onTabChange }) {
-  const { state, assignedCount, resetGame } = useGame();
+  const { state, assignedCount, resetGame, ranking, REPUTATION_MAX } = useGame();
   const [confirmReset, setConfirmReset] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+
+  const playerEntry = ranking.find((e) => e.isPlayer);
 
   return (
     <header className="sticky top-0 z-30 border-b border-white/5 bg-ink-900/70 backdrop-blur-xl">
@@ -46,13 +51,20 @@ export default function Topbar({ activeTab, onTabChange }) {
         </div>
 
         {/* Stats */}
-        <div className="grid grid-cols-3 gap-2 lg:flex lg:items-center lg:gap-3">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:flex lg:items-center lg:gap-3">
           <Stat label="Hari" value={`Hari ke-${state.day}`} tone="sky" />
           <Stat
             label="Saldo"
             value={formatIDR(state.balance)}
             tone={state.balance < 0 ? 'rose' : 'emerald'}
             highlight
+          />
+          <Stat
+            label="Reputasi"
+            value={`${state.reputation}/${REPUTATION_MAX}${
+              playerEntry ? ` · #${playerEntry.rank}` : ''
+            }`}
+            tone="fuchsia"
           />
           <Stat
             label="Armada"
@@ -87,7 +99,7 @@ export default function Topbar({ activeTab, onTabChange }) {
       {/* Tab nav (mobile drawer) */}
       {menuOpen && (
         <nav className="border-t border-white/5 px-4 py-3 lg:hidden">
-          <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
@@ -122,6 +134,7 @@ function Stat({ label, value, tone = 'sky', highlight = false }) {
     emerald: 'text-emerald-300',
     amber: 'text-amber-300',
     rose: 'text-rose-300',
+    fuchsia: 'text-fuchsia-300',
   };
   return (
     <div
