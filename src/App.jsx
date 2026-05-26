@@ -5,7 +5,10 @@ import Topbar from './components/Topbar';
 import Dashboard from './components/Dashboard';
 import Dealer from './components/Dealer';
 import Garasi from './components/Garasi';
+import KantorPusat from './components/KantorPusat';
+import Bengkel from './components/Bengkel';
 import DailyReportModal from './components/DailyReportModal';
+import RoadEventModal from './components/RoadEventModal';
 
 export default function App() {
   const { hydrated, isGameStarted } = useGame();
@@ -36,13 +39,18 @@ export default function App() {
         {activeTab === 'dashboard' && <Dashboard onTabChange={setActiveTab} />}
         {activeTab === 'dealer' && <Dealer onTabChange={setActiveTab} />}
         {activeTab === 'garasi' && <Garasi onTabChange={setActiveTab} />}
+        {activeTab === 'hr' && <KantorPusat onTabChange={setActiveTab} />}
+        {activeTab === 'bengkel' && <Bengkel onTabChange={setActiveTab} />}
       </main>
 
       <footer className="mx-auto max-w-7xl px-6 pb-10 pt-2 text-center text-[11px] text-white/30">
-        Raja Pantura · Tycoon Bus Malam · Phase 1 Build · Save tersimpan otomatis di browser ini.
+        Raja Pantura · Tycoon Bus Malam · Phase 2 Build · Save tersimpan otomatis di browser ini.
       </footer>
 
-      {/* Global daily report modal — overlays any tab. */}
+      {/* Global modals — overlay any tab. Event modal renders ABOVE report
+          because the dispatch flow always resolves the event first, then
+          shows the daily report. */}
+      <RoadEventModal />
       <DailyReportModal />
     </div>
   );

@@ -15,6 +15,11 @@ export const BUS_TYPES = [
     pricePerKm: 300, // Rp per km per seat (base, Normal margin)
     comfort: 1,
     prestige: 1,
+    // Wear multiplier: how aggressively this class loses condition per trip.
+    // Sleepers are more sensitive (more electronics + lower clearance).
+    wearMultiplier: 1.0,
+    // Repair cost: Rp per condition point restored.
+    repairCostPerPoint: 200_000,
     accent: 'from-emerald-500/20 to-emerald-500/5',
     badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-400/30',
     icon: '🚌',
@@ -30,6 +35,8 @@ export const BUS_TYPES = [
     pricePerKm: 600,
     comfort: 3,
     prestige: 3,
+    wearMultiplier: 1.1,
+    repairCostPerPoint: 450_000,
     accent: 'from-sky-500/20 to-sky-500/5',
     badge: 'bg-sky-500/20 text-sky-300 border-sky-400/30',
     icon: '🚍',
@@ -45,11 +52,19 @@ export const BUS_TYPES = [
     pricePerKm: 1000,
     comfort: 5,
     prestige: 5,
+    wearMultiplier: 1.25,
+    repairCostPerPoint: 900_000,
     accent: 'from-amber-500/25 to-amber-500/5',
     badge: 'bg-amber-500/20 text-amber-300 border-amber-400/30',
     icon: '🛌',
   },
 ];
+
+// Condition / workshop thresholds, exported once so UI + economics agree.
+export const CONDITION_MAX = 100;
+export const CONDITION_NEEDS_SERVICE = 40; // shows "Needs Service" badge
+export const CONDITION_BREAKDOWN_RISK = 20; // below this -> 50% mogok chance
+export const BREAKDOWN_FINE = 4_000_000;    // applied if mogok triggers
 
 export const getBusType = (id) => BUS_TYPES.find((b) => b.id === id);
 

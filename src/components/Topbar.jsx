@@ -6,6 +6,8 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: '📊' },
   { id: 'dealer', label: 'Dealer', icon: '🏪' },
   { id: 'garasi', label: 'Garasi', icon: '🚌' },
+  { id: 'hr', label: 'Kantor HR', icon: '🏢' },
+  { id: 'bengkel', label: 'Bengkel', icon: '🛠️' },
 ];
 
 export default function Topbar({ activeTab, onTabChange }) {
@@ -85,7 +87,7 @@ export default function Topbar({ activeTab, onTabChange }) {
       {/* Tab nav (mobile drawer) */}
       {menuOpen && (
         <nav className="border-t border-white/5 px-4 py-3 lg:hidden">
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
