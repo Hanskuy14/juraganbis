@@ -7,7 +7,7 @@ export default function DailyReportModal() {
   const report = state.lastReport;
   if (!report) return null;
 
-  const { day, rows, totals, event, resourcesUsed } = report;
+  const { day, rows, totals, event, resourcesUsed, marketingSpend = 0, pitstopTires = 0 } = report;
   const dispatchedRows = rows.filter((r) => !r.idle);
   const idleRows = rows.filter((r) => r.idle);
   const profitable = totals.profit >= 0;
@@ -60,24 +60,28 @@ export default function DailyReportModal() {
               hint={totals.repairFine > 0 ? 'termasuk denda mogok' : 'razia / lain-lain'}
             />
             <Summary
-              label="Stok Terpakai"
-              value={
-                resourcesUsed
-                  ? `${formatNumber(resourcesUsed.fuel)}L · ${resourcesUsed.tires}b · ${resourcesUsed.parts}p`
-                  : '—'
-              }
-              tone="amber"
-              hint="solar · ban · parts"
+              label="Iklan OTA"
+              value={formatIDR(marketingSpend)}
+              tone={marketingSpend > 0 ? 'amber' : 'sky'}
+              hint={marketingSpend > 0 ? 'bid total per bus' : 'belum pasang iklan'}
             />
             <Summary
               label="Profit Bersih"
-              value={formatIDR(totals.profit)}
-              tone={profitable ? 'amber' : 'rose'}
+              value={formatIDR(totals.profit - marketingSpend)}
+              tone={profitable && totals.profit - marketingSpend >= 0 ? 'amber' : 'rose'}
               big
             />
           </div>
-          <div className="mt-1 text-right text-[11px] text-white/45">
-            Total penumpang: {formatNumber(totals.passengers)} orang
+          <div className="mt-1 flex items-center justify-between text-[11px] text-white/45">
+            <span>Total penumpang: {formatNumber(totals.passengers)} orang</span>
+            {resourcesUsed && (
+              <span>
+                Stok: {formatNumber(resourcesUsed.fuel)}L · {resourcesUsed.tires}b
+                {pitstopTires > 0 && (
+                  <span className="text-amber-300"> ({pitstopTires} pitstop)</span>
+                )}{' '}· {resourcesUsed.parts}p
+              </span>
+            )}
           </div>
         </header>
 

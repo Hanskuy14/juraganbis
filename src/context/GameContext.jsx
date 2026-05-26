@@ -36,7 +36,16 @@ import {
   buildDispatchPlan,
   tickAllTelemetry,
   isAllSettled,
+  applyFrameSlowDown,
+  applyFrameEmergencyPitstop,
 } from '../utils/telemetry';
+import {
+  initialMarketingState,
+  generateReview,
+  applyReview,
+  totalMarketingSpend,
+  MAX_DAILY_AD_SPEND,
+} from '../utils/marketing';
 
 const STARTING_CAPITAL = 800_000_000;
 
@@ -60,6 +69,7 @@ const emptyState = () => {
     inventory: { ...STARTING_INVENTORY },
     marketPrices: market.marketPrices,
     priceHistory: market.priceHistory,
+    marketing: initialMarketingState(),
     createdAt: null,
   };
 };
@@ -90,6 +100,12 @@ function migrateSave(saved) {
     merged.marketPrices = saved.marketPrices;
     merged.priceHistory = saved.priceHistory;
   }
+  // Marketing/Reviews subsystem (Part 2). Old saves do not have it, so we
+  // backfill with a fresh structure — preserves base rating, no reviews.
+  merged.marketing = {
+    ...initialMarketingState(),
+    ...(saved.marketing ?? {}),
+  };
   return merged;
 }
 
@@ -133,6 +149,10 @@ function finalizeFromTelemetry(state) {
   const rows = [...tripRows, ...session.idleRows];
   const totals = summarizeReport(rows);
 
+  // Marketing budget — paid per dispatched bus on the route. Players who
+  // dispatched 5 buses on a Rp 250.000/day route pay Rp 1.250.000 today.
+  const marketingSpend = totalMarketingSpend(state.marketing, session.frames);
+
   // Apply fleet condition + driver stamina changes.
   const fleet = state.fleet.map((bus) => {
     const row = rows.find((r) => r.busId === bus.id);
@@ -152,7 +172,14 @@ function finalizeFromTelemetry(state) {
 
   // Inventory: pre-paid resources were already earmarked in the plan via
   // session.totalCost. Deduct now (broken-down buses still burn fuel/tires).
-  const inventory = deductInventory(state.inventory, session.totalCost);
+  // ALSO deduct any emergency pitstop tires that were consumed mid-trip.
+  const pitstopTires = session.frames.filter((f) => f.usedEmergencyPitstop).length;
+  const totalConsumed = {
+    fuel: session.totalCost.fuel,
+    tires: session.totalCost.tires + pitstopTires,
+    parts: session.totalCost.parts,
+  };
+  const inventory = deductInventory(state.inventory, totalConsumed);
 
   // Market: tick to tomorrow's prices.
   const next = tickMarket(state.marketPrices, state.priceHistory);
@@ -161,15 +188,39 @@ function finalizeFromTelemetry(state) {
   let tiktokBoostDaysLeft = Math.max(0, state.tiktokBoostDaysLeft - 1);
   if (session.event?.id === 'tiktok') tiktokBoostDaysLeft = 3;
 
+  // Reviews + base-rating drift. Each completed dispatch generates at most
+  // one review per bus; 1-stars trigger a 3-day shadowban.
+  let marketing = state.marketing ?? initialMarketingState();
+  for (const row of tripRows) {
+    if (row.idle) continue;
+    const frame = session.frames.find((f) => f.busId === row.busId);
+    const review = generateReview({
+      frame,
+      occupancy: row.occupancy,
+      weatherOutcome: {
+        usedSlowDown: row.usedSlowDown,
+        usedEmergencyPitstop: row.usedEmergencyPitstop,
+        weatherSurvivedBald: frame?.weatherSurvivedBald,
+      },
+      busName: row.busName,
+      routeLabel: row.routeLabel,
+      day: state.day,
+    });
+    if (review) {
+      marketing = applyReview(marketing, review, state.day);
+    }
+  }
+
   return {
     ...state,
     day: state.day + 1,
-    balance: state.balance + totals.profit,
+    balance: state.balance + totals.profit - marketingSpend,
     fleet,
     drivers,
     inventory,
     marketPrices: next.marketPrices,
     priceHistory: next.priceHistory,
+    marketing,
     tiktokBoostDaysLeft,
     pendingDispatch: null,
     pendingEvent: null,
@@ -179,7 +230,9 @@ function finalizeFromTelemetry(state) {
       rows,
       totals,
       event: session.event,
-      resourcesUsed: session.totalCost,
+      resourcesUsed: totalConsumed,
+      marketingSpend,
+      pitstopTires,
       timestamp: Date.now(),
     },
   };
@@ -467,6 +520,9 @@ function reducer(state, action) {
         driversById,
         kernetsById,
         inventory: state.inventory,
+        marketing: state.marketing,
+        currentDay: state.day,
+        tiktokBoostActive: state.tiktokBoostDaysLeft > 0,
       });
 
       // No bus actually goes out today — emit an empty report immediately
@@ -558,6 +614,38 @@ function reducer(state, action) {
       };
     }
 
+    // -- Radio "Race Control" interventions ------------------------------
+    case 'RADIO_SLOW_DOWN': {
+      if (!state.activeTrip || state.activeTrip.status !== 'running') return state;
+      const frames = applyFrameSlowDown(state.activeTrip.frames, action.busId);
+      return { ...state, activeTrip: { ...state.activeTrip, frames } };
+    }
+
+    case 'RADIO_EMERGENCY_PITSTOP': {
+      if (!state.activeTrip || state.activeTrip.status !== 'running') return state;
+      // Must have at least 1 spare tire on hand.
+      if ((state.inventory.tires ?? 0) <= 0) return state;
+      const frames = applyFrameEmergencyPitstop(state.activeTrip.frames, action.busId);
+      // Hold the tire deduction until finalize — frame.usedEmergencyPitstop
+      // is the source of truth; finalizer adds it to totalConsumed.
+      return { ...state, activeTrip: { ...state.activeTrip, frames } };
+    }
+
+    // -- Marketing budget bidding ---------------------------------------
+    case 'SET_ROUTE_BUDGET': {
+      const { routeId, budget } = action;
+      if (!routeId) return state;
+      const clamped = Math.max(0, Math.min(MAX_DAILY_AD_SPEND, Math.round(budget || 0)));
+      const marketing = state.marketing ?? initialMarketingState();
+      return {
+        ...state,
+        marketing: {
+          ...marketing,
+          routeBudgets: { ...marketing.routeBudgets, [routeId]: clamped },
+        },
+      };
+    }
+
     case 'FINALIZE_TELEMETRY': {
       if (!state.activeTrip) return state;
       return finalizeFromTelemetry(state);
@@ -643,6 +731,22 @@ export function GameProvider({ children }) {
   );
   const clearReport = useCallback(() => dispatch({ type: 'CLEAR_REPORT' }), []);
 
+  // Race Control radio interventions.
+  const radioSlowDown = useCallback(
+    (busId) => dispatch({ type: 'RADIO_SLOW_DOWN', busId }),
+    []
+  );
+  const radioEmergencyPitstop = useCallback(
+    (busId) => dispatch({ type: 'RADIO_EMERGENCY_PITSTOP', busId }),
+    []
+  );
+
+  // Marketing — daily ad-spend bid per route.
+  const setRouteBudget = useCallback(
+    (routeId, budget) => dispatch({ type: 'SET_ROUTE_BUDGET', routeId, budget }),
+    []
+  );
+
   // HR
   const hireDriver = useCallback((c) => dispatch({ type: 'HIRE_DRIVER', candidate: c }), []);
   const fireDriver = useCallback((id) => dispatch({ type: 'FIRE_DRIVER', driverId: id }), []);
@@ -707,6 +811,9 @@ export function GameProvider({ children }) {
     tickTelemetry,
     finalizeTelemetry,
     clearReport,
+    radioSlowDown,
+    radioEmergencyPitstop,
+    setRouteBudget,
     hireDriver,
     fireDriver,
     hireKernet,

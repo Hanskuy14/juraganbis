@@ -9,6 +9,14 @@ import {
 import { previewTripEconomics } from '../utils/economics';
 import { STAMINA_FLOOR_TO_DRIVE } from '../data/staff';
 import { ASSET_LIST, tripResourceCost } from '../utils/market';
+import {
+  computeVisibility,
+  visibilityToOccupancy,
+  getRouteBudget,
+  isShadowbanned,
+  TIER_LABELS,
+  BASE_RATING_DEFAULT,
+} from '../utils/marketing';
 import { formatIDR, formatIDRCompact, formatNumber, formatPercent } from '../utils/format';
 
 export default function Dashboard({ onTabChange }) {
@@ -16,6 +24,9 @@ export default function Dashboard({ onTabChange }) {
 
   // Compute per-bus readiness + economic preview.
   const fleetView = useMemo(() => {
+    const marketing = state.marketing;
+    const tiktokBoostActive = (state.tiktokBoostDaysLeft ?? 0) > 0;
+    const banned = isShadowbanned(marketing, state.day);
     return state.fleet.map((bus) => {
       const busType = getBusType(bus.class);
       const route = bus.assignedRoute ? routesById[bus.assignedRoute] : null;
@@ -23,11 +34,29 @@ export default function Dashboard({ onTabChange }) {
       const kernet = bus.assignedKernetId ? kernetsById[bus.assignedKernetId] : null;
 
       const blocker = firstBlocker({ bus, route, driver });
+
+      // Project the visibility for this bus's assigned route — same
+      // formula the dispatcher will lock in tonight. Drives the preview
+      // occupancy so the dashboard agrees with the Marketing tab.
+      let visibility = null;
+      let occupancyPreview;
+      if (busType && route) {
+        visibility = computeVisibility({
+          baseRating: marketing?.baseRating ?? BASE_RATING_DEFAULT,
+          budget: getRouteBudget(marketing, route.id),
+          strategyId: route.strategy,
+          shadowbanned: banned,
+          tiktokBoostActive,
+        });
+        occupancyPreview = visibilityToOccupancy(visibility.score, () => 0.5);
+      }
+
       const preview = busType && route
         ? previewTripEconomics({
             busType,
             distanceKm: route.distanceKm,
             strategyId: route.strategy,
+            occupancyOverride: occupancyPreview?.occupancy,
           })
         : null;
 
@@ -35,9 +64,29 @@ export default function Dashboard({ onTabChange }) {
         ? tripResourceCost({ distanceKm: route.distanceKm, fuelEfficiency: busType.fuelEfficiency })
         : null;
 
-      return { bus, busType, route, driver, kernet, preview, blocker, cost };
+      return {
+        bus,
+        busType,
+        route,
+        driver,
+        kernet,
+        preview,
+        blocker,
+        cost,
+        visibility,
+        visibilityTier: occupancyPreview?.tier,
+        marketingBudget: route ? getRouteBudget(marketing, route.id) : 0,
+      };
     });
-  }, [state.fleet, routesById, driversById, kernetsById]);
+  }, [
+    state.fleet,
+    state.marketing,
+    state.day,
+    state.tiktokBoostDaysLeft,
+    routesById,
+    driversById,
+    kernetsById,
+  ]);
 
   const readyCount = fleetView.filter((p) => !p.blocker).length;
 
@@ -191,6 +240,7 @@ export default function Dashboard({ onTabChange }) {
           </div>
           {state.fleet.length === 0 ? null : (
             <div className="flex gap-2">
+              <button onClick={() => onTabChange('marketing')} className="btn-ghost text-xs">📣 Iklan</button>
               <button onClick={() => onTabChange('hr')} className="btn-ghost text-xs">🏢 HR</button>
               <button onClick={() => onTabChange('bengkel')} className="btn-ghost text-xs">🛠️ Bengkel</button>
               <button onClick={() => onTabChange('garasi')} className="btn-secondary text-xs">
@@ -209,6 +259,7 @@ export default function Dashboard({ onTabChange }) {
                 key={p.bus.id}
                 {...p}
                 onAssign={() => onTabChange('garasi')}
+                onMarketing={() => onTabChange('marketing')}
               />
             ))}
           </div>
@@ -344,7 +395,20 @@ function InventoryReadinessPanel({
   );
 }
 
-function FleetCard({ bus, busType, route, driver, kernet, preview, blocker, onAssign }) {
+function FleetCard({
+  bus,
+  busType,
+  route,
+  driver,
+  kernet,
+  preview,
+  blocker,
+  visibility,
+  visibilityTier,
+  marketingBudget,
+  onAssign,
+  onMarketing,
+}) {
   const strategy = route ? PRICING_STRATEGIES[route.strategy] : null;
   const condition = bus.condition ?? 100;
   const conditionTone =
@@ -425,6 +489,14 @@ function FleetCard({ bus, busType, route, driver, kernet, preview, blocker, onAs
 
           {preview && (
             <>
+              {visibility && (
+                <VisibilityStrip
+                  visibility={visibility}
+                  tier={visibilityTier}
+                  budget={marketingBudget}
+                  onMarketing={onMarketing}
+                />
+              )}
               <div className="mt-3 grid grid-cols-3 gap-1.5 text-center">
                 <Mini label="Tiket" value={formatIDRCompact(preview.ticketPrice)} tone="text-white" />
                 <Mini label="BBM" value={formatIDRCompact(preview.fuelCost)} tone="text-rose-300" />
@@ -464,6 +536,34 @@ function Mini({ label, value, tone }) {
       <div className="text-[10px] uppercase tracking-wider text-white/40">{label}</div>
       <div className={`text-xs font-bold ${tone}`}>{value}</div>
     </div>
+  );
+}
+
+// Visibility / E-Ticketing preview strip on the per-bus card. One-click
+// shortcut to the Marketing tab so players can tweak the bid without
+// hunting through the navigation.
+function VisibilityStrip({ visibility, tier, budget, onMarketing }) {
+  const tierInfo = TIER_LABELS[tier] ?? TIER_LABELS.mid;
+  return (
+    <button
+      type="button"
+      onClick={onMarketing}
+      className="mt-3 flex w-full items-center justify-between gap-2 rounded-xl border border-fuchsia-400/20 bg-fuchsia-500/5 px-3 py-2 text-left transition-colors hover:bg-fuchsia-500/10"
+    >
+      <div>
+        <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-fuchsia-200">
+          <span>📊</span>
+          <span>Visibility OTA</span>
+        </div>
+        <div className={`text-sm font-bold ${tierInfo.tone}`}>
+          {visibility.score}/100 · {tierInfo.emoji} {tierInfo.label}
+        </div>
+      </div>
+      <div className="text-right">
+        <div className="text-[10px] uppercase tracking-wider text-white/45">Bid</div>
+        <div className="text-xs font-bold text-fuchsia-200">{formatIDRCompact(budget)}</div>
+      </div>
+    </button>
   );
 }
 

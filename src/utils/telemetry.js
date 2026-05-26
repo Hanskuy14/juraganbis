@@ -7,6 +7,18 @@
 
 import { getBusType } from '../data/busTypes';
 import { tripResourceCost } from './market';
+import {
+  initWeatherState,
+  tickWeather,
+  applySlowDown as applyWeatherSlowDown,
+  applyEmergencyPitstop as applyWeatherPitstop,
+} from './weather';
+import {
+  computeVisibility,
+  visibilityToOccupancy,
+  getRouteBudget,
+  isShadowbanned,
+} from './marketing';
 
 // --- Tunables -------------------------------------------------------------
 
@@ -28,6 +40,9 @@ export function initBusTelemetry({
   driver,
   kernet,
   resourceCost,
+  marketing,
+  currentDay,
+  tiktokBoostActive = false,
 }) {
   const busType = getBusType(bus.class);
   const totalKm = route.distanceKm;
@@ -37,6 +52,23 @@ export function initBusTelemetry({
   const conditionFactor = (bus.condition ?? 100) / 100;
   const heatLoad = Math.round(20 * (1 - conditionFactor));   // 0..20 °C extra
   const skillRelief = ((driver?.skill ?? 5) - 5) * 0.4;       // -2..+2 °C calmer
+
+  // E-Ticketing visibility: locked at dispatch time so the live telemetry
+  // and the daily report agree on what the player saw before they pressed
+  // BERANGKAT. Players who decide to slash budget mid-trip can't game the
+  // formula retroactively.
+  const budget = getRouteBudget(marketing, route.id);
+  const banned = isShadowbanned(marketing, currentDay ?? 1);
+  const visibility = computeVisibility({
+    baseRating: marketing?.baseRating,
+    budget,
+    strategyId: route.strategy,
+    shadowbanned: banned,
+    tiktokBoostActive,
+  });
+  const occRoll = visibilityToOccupancy(visibility.score);
+
+  const weatherSlice = initWeatherState();
 
   return {
     busId: bus.id,
@@ -71,6 +103,16 @@ export function initBusTelemetry({
     kernetId: kernet?.id ?? null,
     kernetName: kernet?.name ?? null,
 
+    // Marketing snapshot.
+    marketingBudget: budget,
+    visibilityScore: visibility.score,
+    visibilityBreakdown: visibility.breakdown,
+    visibilityTier: occRoll.tier,
+    expectedOccupancy: occRoll.occupancy,
+
+    // Weather + intervention slice (flattened; see utils/weather.js).
+    ...weatherSlice,
+
     // Outcome flags resolved during ticks.
     breakdown: false,
     breakdownReason: null,
@@ -89,18 +131,27 @@ export function initBusTelemetry({
 //   if temp > REDLINE   -> breakdown (overheat)
 //   if tireWear < 5     -> breakdown (blowout) — only if tires were required
 export function tickBusTelemetry(prev) {
-  if (prev.complete || prev.breakdown) return prev;
+  if (prev.complete || prev.breakdown || prev.crashed) return prev;
 
   const next = { ...prev };
   next.elapsedHours = prev.elapsedHours + 1;
-  next.progressKm = Math.min(prev.totalKm, prev.progressKm + TICK_KM_PER_HOUR);
+
+  // Storm + slow-down move slightly slower (driver eased off the gas) so
+  // the trip noticeably stretches when the player intervenes.
+  const speedMult = prev.weather === 'badai' && prev.usedSlowDown ? 0.6 : 1;
+  next.progressKm = Math.min(prev.totalKm, prev.progressKm + TICK_KM_PER_HOUR * speedMult);
 
   // Tire wear: small flat decay + an extra dribble for premium classes.
-  const wearPerHour = (3 + (next.wearMultiplier - 1) * 4) * (next.totalKm / 600);
+  // Storms accelerate wear (slipping rubber on wet asphalt), bald-tire
+  // pitstop will reset back to 100.
+  const stormMult = prev.weather === 'badai' ? 1.6 : 1;
+  const wearPerHour =
+    (3 + (next.wearMultiplier - 1) * 4) * (next.totalKm / 600) * stormMult;
   next.tireWear = Math.max(0, prev.tireWear - wearPerHour);
 
   // Fuel: linear drain across total hours so the gauge zeros out at arrival.
-  const fuelPerHour = next.fuelStarted / next.totalHours;
+  // Apply weather/intervention fuel multiplier (slow-down burns more).
+  const fuelPerHour = (next.fuelStarted / next.totalHours) * (prev.extraFuelMult ?? 1);
   next.fuelRemaining = Math.max(0, prev.fuelRemaining - fuelPerHour);
 
   // Engine temp: drift toward (optimal + heatLoad - skillRelief), plus jitter.
@@ -132,6 +183,18 @@ export function tickBusTelemetry(prev) {
     next.breakdown = true;
     next.breakdownReason = 'blowout';
     return next;
+  }
+
+  // Weather pass — may flip the storm flag, set slip risk, or even crash
+  // the bus if the player has been ignoring a storm + bald tires.
+  const weatherUpdate = tickWeather(next);
+  Object.assign(next, weatherUpdate);
+
+  // Crash flagged this tick → mark as breakdown so the report engine
+  // treats it as a failed trip with extra penalty.
+  if (next.crashed && !next.breakdown) {
+    next.breakdown = true;
+    next.breakdownReason = 'crash';
   }
 
   // Arrival.
@@ -169,6 +232,9 @@ export function buildDispatchPlan({
   driversById,
   kernetsById,
   inventory,
+  marketing,
+  currentDay,
+  tiktokBoostActive = false,
 }) {
   const frames = [];
   const idleRows = [];
@@ -236,10 +302,35 @@ export function buildDispatchPlan({
       parts: totalCost.parts + cost.parts,
     };
 
-    frames.push(initBusTelemetry({ bus, route, driver, kernet, resourceCost: cost }));
+    frames.push(
+      initBusTelemetry({
+        bus,
+        route,
+        driver,
+        kernet,
+        resourceCost: cost,
+        marketing,
+        currentDay,
+        tiktokBoostActive,
+      })
+    );
   }
 
   return { frames, idleRows, totalCost };
+}
+
+// --- Intervention helpers (used by reducer) ------------------------------
+
+// Apply a "Slow Down" radio command to one frame inside the active session.
+// Pure: returns a new frames array. The reducer wraps this in an action.
+export function applyFrameSlowDown(frames, busId) {
+  return frames.map((f) => (f.busId === busId ? applyWeatherSlowDown(f) : f));
+}
+
+// Apply an emergency pitstop to one frame. The reducer is responsible for
+// deducting the spare tire from inventory; this only mutates the frame.
+export function applyFrameEmergencyPitstop(frames, busId) {
+  return frames.map((f) => (f.busId === busId ? applyWeatherPitstop(f) : f));
 }
 
 function makeIdleRow(bus, busType, reason, label) {
