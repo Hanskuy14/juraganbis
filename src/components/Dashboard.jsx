@@ -8,25 +8,25 @@ import {
 } from '../data/busTypes';
 import { previewTripEconomics } from '../utils/economics';
 import { STAMINA_FLOOR_TO_DRIVE } from '../data/staff';
-import { loanDailyDeduction } from '../data/bank';
-import { formatIDR, formatIDRCompact, formatPercent } from '../utils/format';
+import { ASSET_LIST, tripResourceCost } from '../utils/market';
+import {
+  computeVisibility,
+  visibilityToOccupancy,
+  getRouteBudget,
+  isShadowbanned,
+  TIER_LABELS,
+  BASE_RATING_DEFAULT,
+} from '../utils/marketing';
+import { formatIDR, formatIDRCompact, formatNumber, formatPercent } from '../utils/format';
 
 export default function Dashboard({ onTabChange }) {
-  const {
-    state,
-    routesById,
-    driversById,
-    kernetsById,
-    beginDispatch,
-    ranking,
-    REPUTATION_MAX,
-    PAILIT_GRACE_DAYS,
-  } = useGame();
-  const playerEntry = ranking.find((e) => e.isPlayer);
-  const nextLoanDeduction = loanDailyDeduction(state.loan);
+  const { state, routesById, driversById, kernetsById, beginDispatch } = useGame();
 
   // Compute per-bus readiness + economic preview.
   const fleetView = useMemo(() => {
+    const marketing = state.marketing;
+    const tiktokBoostActive = (state.tiktokBoostDaysLeft ?? 0) > 0;
+    const banned = isShadowbanned(marketing, state.day);
     return state.fleet.map((bus) => {
       const busType = getBusType(bus.class);
       const route = bus.assignedRoute ? routesById[bus.assignedRoute] : null;
@@ -34,19 +34,84 @@ export default function Dashboard({ onTabChange }) {
       const kernet = bus.assignedKernetId ? kernetsById[bus.assignedKernetId] : null;
 
       const blocker = firstBlocker({ bus, route, driver });
+
+      // Project the visibility for this bus's assigned route — same
+      // formula the dispatcher will lock in tonight. Drives the preview
+      // occupancy so the dashboard agrees with the Marketing tab.
+      let visibility = null;
+      let occupancyPreview;
+      if (busType && route) {
+        visibility = computeVisibility({
+          baseRating: marketing?.baseRating ?? BASE_RATING_DEFAULT,
+          budget: getRouteBudget(marketing, route.id),
+          strategyId: route.strategy,
+          shadowbanned: banned,
+          tiktokBoostActive,
+        });
+        occupancyPreview = visibilityToOccupancy(visibility.score, () => 0.5);
+      }
+
       const preview = busType && route
         ? previewTripEconomics({
             busType,
             distanceKm: route.distanceKm,
             strategyId: route.strategy,
+            occupancyOverride: occupancyPreview?.occupancy,
           })
         : null;
 
-      return { bus, busType, route, driver, kernet, preview, blocker };
+      const cost = busType && route
+        ? tripResourceCost({ distanceKm: route.distanceKm, fuelEfficiency: busType.fuelEfficiency })
+        : null;
+
+      return {
+        bus,
+        busType,
+        route,
+        driver,
+        kernet,
+        preview,
+        blocker,
+        cost,
+        visibility,
+        visibilityTier: occupancyPreview?.tier,
+        marketingBudget: route ? getRouteBudget(marketing, route.id) : 0,
+      };
     });
-  }, [state.fleet, routesById, driversById, kernetsById]);
+  }, [
+    state.fleet,
+    state.marketing,
+    state.day,
+    state.tiktokBoostDaysLeft,
+    routesById,
+    driversById,
+    kernetsById,
+  ]);
 
   const readyCount = fleetView.filter((p) => !p.blocker).length;
+
+  // Aggregate inventory cost for ready-to-dispatch buses.
+  const totalCost = useMemo(() => {
+    return fleetView.reduce(
+      (acc, p) => {
+        if (p.blocker || !p.cost) return acc;
+        acc.fuel += p.cost.fuel;
+        acc.tires += p.cost.tires;
+        acc.parts += p.cost.parts;
+        return acc;
+      },
+      { fuel: 0, tires: 0, parts: 0 }
+    );
+  }, [fleetView]);
+
+  // What the player has on hand vs. what tonight will burn.
+  const inventory = state.inventory;
+  const inventoryShort = {
+    fuel: Math.max(0, totalCost.fuel - inventory.fuel),
+    tires: Math.max(0, totalCost.tires - inventory.tires),
+    parts: Math.max(0, totalCost.parts - inventory.parts),
+  };
+  const anyShort = inventoryShort.fuel > 0 || inventoryShort.tires > 0 || inventoryShort.parts > 0;
 
   const totalsPreview = useMemo(() => {
     return fleetView.reduce(
@@ -61,29 +126,10 @@ export default function Dashboard({ onTabChange }) {
     );
   }, [fleetView]);
 
-  const canDispatch = state.fleet.length > 0 && !state.gameOver;
+  const canDispatch = state.fleet.length > 0;
 
   return (
     <div className="space-y-6">
-      {/* Pailit warning */}
-      {state.daysInDebt > 0 && !state.gameOver && (
-        <div className="glass-panel flex items-start gap-3 border-rose-400/30 bg-rose-500/[0.06] p-4">
-          <div className="text-3xl">⚠️</div>
-          <div className="flex-1">
-            <div className="font-display text-sm font-bold text-rose-200">
-              Saldo PO sudah {state.daysInDebt} hari minus
-            </div>
-            <div className="text-xs text-rose-100/80">
-              Lunasi cicilan / kurangi pengeluaran. Pailit otomatis bila{' '}
-              {PAILIT_GRACE_DAYS} hari berturut-turut minus.
-            </div>
-          </div>
-          <button onClick={() => onTabChange('bank')} className="btn-secondary text-xs">
-            Buka Bank
-          </button>
-        </div>
-      )}
-
       {/* TikTok boost banner */}
       {state.tiktokBoostDaysLeft > 0 && (
         <div className="glass-panel flex items-center gap-3 border-fuchsia-400/30 bg-fuchsia-500/5 p-4">
@@ -99,27 +145,6 @@ export default function Dashboard({ onTabChange }) {
           <span className="pill border-fuchsia-400/30 bg-fuchsia-500/15 text-fuchsia-200">
             {state.tiktokBoostDaysLeft} hari
           </span>
-        </div>
-      )}
-
-      {/* Loan deduction banner */}
-      {state.loan && (
-        <div className="glass-panel flex flex-wrap items-center gap-3 border-amber-400/30 bg-amber-500/[0.05] p-4">
-          <div className="text-3xl">💰</div>
-          <div className="flex-1">
-            <div className="font-display text-sm font-bold text-amber-200">
-              Cicilan kredit aktif: sisa {formatIDR(state.loan.remaining)}
-            </div>
-            <div className="text-xs text-white/65">
-              Berangkat berikutnya akan dipotong{' '}
-              <span className="text-amber-300">{formatIDR(nextLoanDeduction.total)}</span>{' '}
-              ({formatIDRCompact(nextLoanDeduction.installment)} pokok +{' '}
-              {formatIDRCompact(nextLoanDeduction.interest)} bunga).
-            </div>
-          </div>
-          <button onClick={() => onTabChange('bank')} className="btn-secondary text-xs">
-            Lihat Pinjaman
-          </button>
         </div>
       )}
 
@@ -165,7 +190,7 @@ export default function Dashboard({ onTabChange }) {
         </div>
 
         {/* Preview totals */}
-        <div className="relative mt-5 grid grid-cols-2 gap-2 sm:grid-cols-5">
+        <div className="relative mt-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
           <PreviewStat
             label="Estimasi Pendapatan"
             value={formatIDRCompact(totalsPreview.revenue)}
@@ -185,16 +210,6 @@ export default function Dashboard({ onTabChange }) {
             hint="Sebelum gaji & kejadian"
           />
           <PreviewStat
-            label="Reputasi"
-            value={`${state.reputation}/${REPUTATION_MAX}`}
-            tone="fuchsia"
-            hint={
-              playerEntry
-                ? `Rank #${playerEntry.rank} dari ${ranking.length}`
-                : 'Lihat leaderboard'
-            }
-          />
-          <PreviewStat
             label="Saldo Sekarang"
             value={formatIDRCompact(state.balance)}
             tone={state.balance < 0 ? 'rose' : 'sky'}
@@ -202,6 +217,17 @@ export default function Dashboard({ onTabChange }) {
           />
         </div>
       </section>
+
+      {/* Inventory readiness — what tonight's dispatch will burn vs. what
+          we have on hand. */}
+      <InventoryReadinessPanel
+        inventory={inventory}
+        totalCost={totalCost}
+        shortfall={inventoryShort}
+        anyShort={anyShort}
+        marketPrices={state.marketPrices}
+        onTabChange={onTabChange}
+      />
 
       {/* Fleet list */}
       <section>
@@ -214,6 +240,7 @@ export default function Dashboard({ onTabChange }) {
           </div>
           {state.fleet.length === 0 ? null : (
             <div className="flex gap-2">
+              <button onClick={() => onTabChange('marketing')} className="btn-ghost text-xs">📣 Iklan</button>
               <button onClick={() => onTabChange('hr')} className="btn-ghost text-xs">🏢 HR</button>
               <button onClick={() => onTabChange('bengkel')} className="btn-ghost text-xs">🛠️ Bengkel</button>
               <button onClick={() => onTabChange('garasi')} className="btn-secondary text-xs">
@@ -232,6 +259,7 @@ export default function Dashboard({ onTabChange }) {
                 key={p.bus.id}
                 {...p}
                 onAssign={() => onTabChange('garasi')}
+                onMarketing={() => onTabChange('marketing')}
               />
             ))}
           </div>
@@ -262,7 +290,6 @@ function PreviewStat({ label, value, hint, tone = 'sky' }) {
     rose: 'text-rose-300',
     amber: 'text-amber-300',
     sky: 'text-sky-300',
-    fuchsia: 'text-fuchsia-300',
   };
   return (
     <div className="glass-card flex flex-col px-4 py-3">
@@ -275,7 +302,113 @@ function PreviewStat({ label, value, hint, tone = 'sky' }) {
   );
 }
 
-function FleetCard({ bus, busType, route, driver, kernet, preview, blocker, onAssign }) {
+// Inventory readiness — quick check of "have I stocked enough for tonight?".
+// Renders nothing if there's literally nothing to dispatch yet.
+function InventoryReadinessPanel({
+  inventory,
+  totalCost,
+  shortfall,
+  anyShort,
+  marketPrices,
+  onTabChange,
+}) {
+  const hasAnyDemand = totalCost.fuel > 0 || totalCost.tires > 0 || totalCost.parts > 0;
+
+  return (
+    <section className="glass-panel p-5">
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 className="font-display text-sm font-bold text-white">
+            🏭 Gudang &amp; Konsumsi Malam Ini
+          </h3>
+          <p className="text-[11px] text-white/55">
+            Bus tidak akan berangkat kalau stok komoditasnya kurang. Cek tab Pasar buat re-stok.
+          </p>
+        </div>
+        <button onClick={() => onTabChange('pasar')} className="btn-secondary text-xs">
+          Pasar &amp; Gudang →
+        </button>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-3">
+        {ASSET_LIST.map((a) => {
+          const stock = inventory[a.id] ?? 0;
+          const need = totalCost[a.id] ?? 0;
+          const short = shortfall[a.id] ?? 0;
+          const ok = need === 0 || stock >= need;
+          return (
+            <div
+              key={a.id}
+              className={`rounded-xl border px-3 py-2.5 ${
+                ok
+                  ? 'border-white/10 bg-black/25'
+                  : 'border-rose-400/40 bg-rose-500/10'
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-lg">{a.icon}</span>
+                  <span className="font-display text-sm font-bold text-white">{a.name}</span>
+                </div>
+                <span className={`pill ${ok ? a.badge : 'border-rose-400/40 bg-rose-500/15 text-rose-200'}`}>
+                  {ok ? 'OK' : `Kurang ${formatNumber(short)} ${a.unit}`}
+                </span>
+              </div>
+              <div className="mt-1.5 grid grid-cols-3 gap-1 text-[11px]">
+                <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
+                  <div className="text-[9px] uppercase tracking-wider text-white/40">Stok</div>
+                  <div className="text-xs font-bold text-white">
+                    {formatNumber(stock)} {a.unit}
+                  </div>
+                </div>
+                <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
+                  <div className="text-[9px] uppercase tracking-wider text-white/40">Butuh</div>
+                  <div className={`text-xs font-bold ${need > 0 ? 'text-amber-300' : 'text-white/55'}`}>
+                    {formatNumber(need)} {a.unit}
+                  </div>
+                </div>
+                <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
+                  <div className="text-[9px] uppercase tracking-wider text-white/40">Harga</div>
+                  <div className="text-xs font-bold text-emerald-300">
+                    {formatIDRCompact(marketPrices[a.id] ?? a.basePrice)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {anyShort && hasAnyDemand && (
+        <div className="mt-3 flex items-start gap-2 rounded-xl border border-rose-400/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-100">
+          <span className="text-base">⚠</span>
+          <div>
+            <div className="font-semibold">Stok kurang!</div>
+            <div className="text-rose-100/80">
+              Sebagian bus akan dipaksa istirahat malam ini karena gudangnya kosong. Beli dulu di
+              tab Pasar &amp; Gudang.
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FleetCard({
+  bus,
+  busType,
+  route,
+  driver,
+  kernet,
+  preview,
+  blocker,
+  visibility,
+  visibilityTier,
+  marketingBudget,
+  onAssign,
+  onMarketing,
+}) {
   const strategy = route ? PRICING_STRATEGIES[route.strategy] : null;
   const condition = bus.condition ?? 100;
   const conditionTone =
@@ -356,6 +489,14 @@ function FleetCard({ bus, busType, route, driver, kernet, preview, blocker, onAs
 
           {preview && (
             <>
+              {visibility && (
+                <VisibilityStrip
+                  visibility={visibility}
+                  tier={visibilityTier}
+                  budget={marketingBudget}
+                  onMarketing={onMarketing}
+                />
+              )}
               <div className="mt-3 grid grid-cols-3 gap-1.5 text-center">
                 <Mini label="Tiket" value={formatIDRCompact(preview.ticketPrice)} tone="text-white" />
                 <Mini label="BBM" value={formatIDRCompact(preview.fuelCost)} tone="text-rose-300" />
@@ -395,6 +536,34 @@ function Mini({ label, value, tone }) {
       <div className="text-[10px] uppercase tracking-wider text-white/40">{label}</div>
       <div className={`text-xs font-bold ${tone}`}>{value}</div>
     </div>
+  );
+}
+
+// Visibility / E-Ticketing preview strip on the per-bus card. One-click
+// shortcut to the Marketing tab so players can tweak the bid without
+// hunting through the navigation.
+function VisibilityStrip({ visibility, tier, budget, onMarketing }) {
+  const tierInfo = TIER_LABELS[tier] ?? TIER_LABELS.mid;
+  return (
+    <button
+      type="button"
+      onClick={onMarketing}
+      className="mt-3 flex w-full items-center justify-between gap-2 rounded-xl border border-fuchsia-400/20 bg-fuchsia-500/5 px-3 py-2 text-left transition-colors hover:bg-fuchsia-500/10"
+    >
+      <div>
+        <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-fuchsia-200">
+          <span>📊</span>
+          <span>Visibility OTA</span>
+        </div>
+        <div className={`text-sm font-bold ${tierInfo.tone}`}>
+          {visibility.score}/100 · {tierInfo.emoji} {tierInfo.label}
+        </div>
+      </div>
+      <div className="text-right">
+        <div className="text-[10px] uppercase tracking-wider text-white/45">Bid</div>
+        <div className="text-xs font-bold text-fuchsia-200">{formatIDRCompact(budget)}</div>
+      </div>
+    </button>
   );
 }
 

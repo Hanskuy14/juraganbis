@@ -6,6 +6,8 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: '📊' },
   { id: 'dealer', label: 'Dealer', icon: '🏪' },
   { id: 'garasi', label: 'Garasi', icon: '🚌' },
+  { id: 'marketing', label: 'E-Ticketing', icon: '📣' },
+  { id: 'pasar', label: 'Pasar', icon: '📈' },
   { id: 'hr', label: 'Kantor HR', icon: '🏢' },
   { id: 'bengkel', label: 'Bengkel', icon: '🛠️' },
   { id: 'bank', label: 'Bank', icon: '💰' },
@@ -14,10 +16,11 @@ const TABS = [
 ];
 
 export default function Topbar({ activeTab, onTabChange }) {
-  const { state, assignedCount, resetGame, ranking, REPUTATION_MAX } = useGame();
+  const { state, assignedCount, resetGame, REPUTATION_MAX } = useGame();
   const [confirmReset, setConfirmReset] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
 
+  const ranking = useGame().ranking ?? [];
   const playerEntry = ranking.find((e) => e.isPlayer);
 
   return (
@@ -51,7 +54,7 @@ export default function Topbar({ activeTab, onTabChange }) {
         </div>
 
         {/* Stats */}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:flex lg:items-center lg:gap-3">
+        <div className="grid grid-cols-2 gap-2 lg:flex lg:items-center lg:gap-3">
           <Stat label="Hari" value={`Hari ke-${state.day}`} tone="sky" />
           <Stat
             label="Saldo"
@@ -61,9 +64,7 @@ export default function Topbar({ activeTab, onTabChange }) {
           />
           <Stat
             label="Reputasi"
-            value={`${state.reputation}/${REPUTATION_MAX}${
-              playerEntry ? ` · #${playerEntry.rank}` : ''
-            }`}
+            value={`${state.reputation}/${REPUTATION_MAX}${playerEntry ? ` · #${playerEntry.rank}` : ''}`}
             tone="fuchsia"
           />
           <Stat
@@ -77,7 +78,7 @@ export default function Topbar({ activeTab, onTabChange }) {
       {/* Tab nav (desktop) */}
       <nav className="hidden border-t border-white/5 lg:block">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-6">
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 overflow-x-auto">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
@@ -99,7 +100,7 @@ export default function Topbar({ activeTab, onTabChange }) {
       {/* Tab nav (mobile drawer) */}
       {menuOpen && (
         <nav className="border-t border-white/5 px-4 py-3 lg:hidden">
-          <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
@@ -173,14 +174,14 @@ function TabButton({ active, onClick, icon, label, stacked = false }) {
     <button
       type="button"
       onClick={onClick}
-      className={`relative flex items-center gap-2 px-4 py-3 text-sm font-semibold transition-colors ${
+      className={`relative flex shrink-0 items-center gap-2 px-3 py-3 text-sm font-semibold transition-colors ${
         active ? 'text-amber-300' : 'text-white/60 hover:text-white'
       }`}
     >
       <span>{icon}</span>
       {label}
       {active && (
-        <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-amber-400" />
+        <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-amber-400" />
       )}
     </button>
   );
