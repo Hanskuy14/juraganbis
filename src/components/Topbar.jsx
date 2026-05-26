@@ -6,6 +6,8 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: '📊' },
   { id: 'dealer', label: 'Dealer', icon: '🏪' },
   { id: 'garasi', label: 'Garasi', icon: '🚌' },
+  { id: 'hr', label: 'HR', icon: '🏢' },
+  { id: 'bengkel', label: 'Bengkel', icon: '🔧' },
 ];
 
 export default function Topbar({ activeTab, onTabChange }) {
@@ -13,10 +15,11 @@ export default function Topbar({ activeTab, onTabChange }) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
 
+  const viralBoost = state.activeBoosts?.find((b) => b.type === 'viral');
+
   return (
     <header className="sticky top-0 z-30 border-b border-white/5 bg-ink-900/70 backdrop-blur-xl">
       <div className="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
-        {/* Brand + PO name */}
         <div className="flex items-center justify-between gap-3 lg:justify-start">
           <div className="flex items-center gap-3">
             <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 font-display text-lg font-extrabold text-ink-900 shadow-glass">
@@ -31,8 +34,6 @@ export default function Topbar({ activeTab, onTabChange }) {
               </div>
             </div>
           </div>
-
-          {/* Mobile menu toggle */}
           <button
             type="button"
             onClick={() => setMenuOpen((o) => !o)}
@@ -43,7 +44,6 @@ export default function Topbar({ activeTab, onTabChange }) {
           </button>
         </div>
 
-        {/* Stats */}
         <div className="grid grid-cols-3 gap-2 lg:flex lg:items-center lg:gap-3">
           <Stat label="Hari" value={`Hari ke-${state.day}`} tone="sky" />
           <Stat
@@ -54,16 +54,33 @@ export default function Topbar({ activeTab, onTabChange }) {
           />
           <Stat
             label="Armada"
-            value={`${state.fleet.length} bus · ${assignedCount} aktif`}
+            value={`${state.fleet.length} bus · ${assignedCount} siap`}
             tone="amber"
           />
         </div>
       </div>
 
-      {/* Tab nav (desktop) */}
+      {/* Active boost ribbon (viral, etc.) */}
+      {viralBoost && (
+        <div className="border-t border-emerald-400/20 bg-gradient-to-r from-emerald-500/10 via-transparent to-amber-500/10">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2 px-4 py-1.5 text-[11px] sm:px-6">
+            <span className="flex items-center gap-2 text-emerald-200">
+              <span className="text-base">🎬</span>
+              <strong className="font-semibold">Viral TikTok</strong>
+              <span className="text-white/55">
+                Demand ×{viralBoost.demandMult} aktif
+              </span>
+            </span>
+            <span className="font-semibold text-emerald-200">
+              {viralBoost.daysLeft} hari tersisa
+            </span>
+          </div>
+        </div>
+      )}
+
       <nav className="hidden border-t border-white/5 lg:block">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-6">
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 overflow-x-auto">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
@@ -82,10 +99,9 @@ export default function Topbar({ activeTab, onTabChange }) {
         </div>
       </nav>
 
-      {/* Tab nav (mobile drawer) */}
       {menuOpen && (
         <nav className="border-t border-white/5 px-4 py-3 lg:hidden">
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
@@ -143,7 +159,7 @@ function TabButton({ active, onClick, icon, label, stacked = false }) {
       <button
         type="button"
         onClick={onClick}
-        className={`flex flex-col items-center gap-1 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
+        className={`flex flex-col items-center gap-1 rounded-xl border px-2 py-2 text-[11px] font-semibold transition-colors ${
           active
             ? 'border-amber-400/40 bg-amber-500/10 text-amber-200'
             : 'border-white/5 bg-white/[0.02] text-white/60 hover:bg-white/5'
@@ -158,7 +174,7 @@ function TabButton({ active, onClick, icon, label, stacked = false }) {
     <button
       type="button"
       onClick={onClick}
-      className={`relative flex items-center gap-2 px-4 py-3 text-sm font-semibold transition-colors ${
+      className={`relative flex shrink-0 items-center gap-2 px-4 py-3 text-sm font-semibold transition-colors ${
         active ? 'text-amber-300' : 'text-white/60 hover:text-white'
       }`}
     >

@@ -7,10 +7,11 @@ export default function DailyReportModal() {
   const report = state.lastReport;
   if (!report) return null;
 
-  const { day, rows, totals } = report;
+  const { day, rows, totals, event } = report;
   const dispatchedRows = rows.filter((r) => !r.idle);
   const idleRows = rows.filter((r) => r.idle);
-  const profitable = totals.profit >= 0;
+  const breakdownCount = totals.breakdowns ?? 0;
+  const profitable = totals.profit >= 0 && breakdownCount === 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/70 p-3 backdrop-blur-sm sm:items-center sm:p-4">
@@ -34,39 +35,32 @@ export default function DailyReportModal() {
                 Laporan Harian · Hari ke-{day}
               </span>
               <h3 className="mt-2 font-display text-xl font-extrabold text-white sm:text-2xl">
-                {profitable ? 'Cuan malam ini! 🎉' : 'Tekor malam ini... 😓'}
+                {breakdownCount > 0
+                  ? `Ada ${breakdownCount} bus mogok... 🚨`
+                  : profitable
+                  ? 'Cuan malam ini! 🎉'
+                  : 'Tekor malam ini... 😓'}
               </h3>
               <p className="mt-1 text-sm text-white/60">
-                {totals.dispatched} bus berangkat · {totals.idle} bus istirahat
+                {totals.dispatched} bus berangkat · {totals.idle} bus istirahat · {formatNumber(totals.passengers)} penumpang terangkut
               </p>
             </div>
-            <button
-              onClick={clearReport}
-              className="btn-ghost text-sm"
-              aria-label="Tutup"
-            >
+            <button onClick={clearReport} className="btn-ghost text-sm" aria-label="Tutup">
               ✕
             </button>
           </div>
 
           <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
             <Summary label="Pendapatan" value={formatIDR(totals.revenue)} tone="emerald" />
-            <Summary label="Biaya BBM" value={formatIDR(totals.fuelCost)} tone="rose" />
-            <Summary
-              label="Profit Bersih"
-              value={formatIDR(totals.profit)}
-              tone={profitable ? 'amber' : 'rose'}
-              big
-            />
-            <Summary
-              label="Total Penumpang"
-              value={`${formatNumber(totals.passengers)} org`}
-              tone="sky"
-            />
+            <Summary label="BBM + Gaji" value={formatIDR(totals.fuelCost + totals.salaryCost)} tone="rose" />
+            <Summary label="Profit Bersih" value={formatIDR(totals.profit)} tone={profitable ? 'amber' : 'rose'} big />
+            <Summary label="Kejadian" value={event ? event.title : 'Tidak ada'} tone="sky" />
           </div>
         </header>
 
         <div className="flex-1 space-y-4 overflow-y-auto p-5">
+          {event && <EventBanner event={event} />}
+
           {dispatchedRows.length > 0 && (
             <section>
               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-white/55">
@@ -92,8 +86,8 @@ export default function DailyReportModal() {
                     className="flex items-center justify-between rounded-lg border border-white/5 bg-black/15 px-3 py-2 text-sm"
                   >
                     <span className="text-white/75">{row.busName}</span>
-                    <span className="pill border-white/10 bg-white/5 text-white/50">
-                      Belum ada trayek
+                    <span className="pill border-white/10 bg-white/5 text-white/55">
+                      {row.idleReason ?? 'Idle'}
                     </span>
                   </div>
                 ))}
@@ -103,19 +97,47 @@ export default function DailyReportModal() {
 
           {dispatchedRows.length === 0 && idleRows.length === 0 && (
             <p className="rounded-xl border border-white/10 bg-black/20 px-4 py-6 text-center text-sm text-white/55">
-              Belum ada bus di garasi. Beli unit pertama dulu, ya.
+              Belum ada bus di garasi.
             </p>
           )}
         </div>
 
         <footer className="flex items-center justify-between gap-3 border-t border-white/10 bg-black/20 p-4">
           <p className="text-[11px] text-white/50">
-            Hari {day} → Hari {day + 1}. Saldo otomatis disesuaikan.
+            Hari {day} → Hari {day + 1}. Saldo, kondisi bus, dan stamina supir sudah disesuaikan.
           </p>
           <button onClick={clearReport} className="btn-primary">
-            Lanjutkan ke hari berikutnya
+            Lanjut ke hari berikutnya
           </button>
         </footer>
+      </div>
+    </div>
+  );
+}
+
+function EventBanner({ event }) {
+  const tone =
+    event.id === 'razia'
+      ? 'border-rose-400/30 bg-rose-500/10 text-rose-100'
+      : event.id === 'macet'
+      ? 'border-amber-400/30 bg-amber-500/10 text-amber-100'
+      : 'border-emerald-400/30 bg-emerald-500/10 text-emerald-100';
+  return (
+    <div className={`rounded-xl border ${tone} p-3`}>
+      <div className="flex items-start gap-3">
+        <span className="text-2xl">{event.icon}</span>
+        <div>
+          <div className="font-display text-sm font-bold text-white">
+            {event.title}
+            {event.choice === 'bribe' && <span className="ml-2 text-xs opacity-80">— bayar uang kopi</span>}
+            {event.choice === 'refuse' && <span className="ml-2 text-xs opacity-80">— tolak razia</span>}
+          </div>
+          {event.notes && event.notes.length > 0 && (
+            <ul className="mt-1 space-y-0.5 text-xs opacity-90">
+              {event.notes.map((n, i) => <li key={i}>· {n}</li>)}
+            </ul>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -130,10 +152,8 @@ function Summary({ label, value, tone, big = false }) {
   };
   return (
     <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2">
-      <div className="text-[10px] font-semibold uppercase tracking-wider text-white/45">
-        {label}
-      </div>
-      <div className={`mt-0.5 font-display font-bold ${tones[tone]} ${big ? 'text-lg' : 'text-sm'}`}>
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-white/45">{label}</div>
+      <div className={`mt-0.5 truncate font-display font-bold ${tones[tone]} ${big ? 'text-lg' : 'text-sm'}`}>
         {value}
       </div>
     </div>
@@ -144,26 +164,28 @@ function ReportRow({ row }) {
   const strategy = row.strategy ? PRICING_STRATEGIES[row.strategy] : null;
   const profitable = row.profit >= 0;
   return (
-    <div className="grid grid-cols-1 gap-2 px-3 py-3 text-sm sm:grid-cols-[1fr_auto] sm:items-center">
-      <div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-display text-sm font-bold text-white">
-            {row.busName}
-          </span>
-          <span className="pill border-white/10 bg-white/5 text-white/55">
-            {row.busClass}
-          </span>
-          {strategy && (
-            <span className={`pill ${strategy.tone}`}>{strategy.label}</span>
-          )}
-        </div>
-        <div className="mt-0.5 text-[12px] text-white/55">
-          {row.routeLabel} · {row.distanceKm} km · {row.passengers}/{row.capacity} kursi ({formatPercent(row.occupancy)})
-        </div>
+    <div className="space-y-1 px-3 py-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-display text-sm font-bold text-white">{row.busName}</span>
+        <span className="pill border-white/10 bg-white/5 text-white/55">{row.busClass}</span>
+        {strategy && <span className={`pill ${strategy.tone}`}>{strategy.label}</span>}
+        {row.breakdown && (
+          <span className="pill border-rose-400/40 bg-rose-500/20 text-rose-200">🚨 Mogok</span>
+        )}
       </div>
-      <div className="grid grid-cols-3 gap-1.5 text-right sm:min-w-[16rem] sm:grid-cols-3">
-        <Cell label="Pendapatan" value={formatIDR(row.revenue)} tone="text-emerald-300" />
+      <div className="text-[12px] text-white/55">
+        {row.routeLabel} · {row.distanceKm} km · {row.passengers}/{row.capacity} kursi ({formatPercent(row.occupancy)})
+      </div>
+      <div className="text-[11px] text-white/45">
+        {row.driverName ?? 'Tanpa supir'}
+        {row.kernetName && <span> + {row.kernetName}</span>}
+        {' · '}
+        Kondisi −{row.conditionDamage} HP, stamina −{row.staminaUsed}
+      </div>
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+        <Cell label="Pendapatan" value={formatIDR(row.revenue + (row.kernetBonus ?? 0))} tone="text-emerald-300" />
         <Cell label="BBM" value={formatIDR(row.fuelCost)} tone="text-rose-300" />
+        <Cell label="Gaji crew" value={formatIDR(row.salaryCost ?? 0)} tone="text-rose-300" />
         <Cell
           label="Profit"
           value={formatIDR(row.profit)}
@@ -176,10 +198,8 @@ function ReportRow({ row }) {
 
 function Cell({ label, value, tone = 'text-white' }) {
   return (
-    <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
-      <div className="text-[9px] uppercase tracking-wider text-white/40">
-        {label}
-      </div>
+    <div className="rounded-md border border-white/5 bg-black/30 px-2 py-1">
+      <div className="text-[9px] uppercase tracking-wider text-white/40">{label}</div>
       <div className={`text-[11px] font-bold ${tone}`}>{value}</div>
     </div>
   );

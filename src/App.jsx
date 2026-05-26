@@ -5,14 +5,15 @@ import Topbar from './components/Topbar';
 import Dashboard from './components/Dashboard';
 import Dealer from './components/Dealer';
 import Garasi from './components/Garasi';
+import HR from './components/HR';
+import Bengkel from './components/Bengkel';
 import DailyReportModal from './components/DailyReportModal';
+import EventModal from './components/EventModal';
 
 export default function App() {
   const { hydrated, isGameStarted } = useGame();
   const [activeTab, setActiveTab] = useState('dashboard');
 
-  // While we're checking localStorage, show a tiny placeholder. Avoids the
-  // "main menu flashes for 1 frame even though a save exists" feeling.
   if (!hydrated) {
     return (
       <div className="grid min-h-screen place-items-center bg-ink-900 bg-aurora">
@@ -36,13 +37,17 @@ export default function App() {
         {activeTab === 'dashboard' && <Dashboard onTabChange={setActiveTab} />}
         {activeTab === 'dealer' && <Dealer onTabChange={setActiveTab} />}
         {activeTab === 'garasi' && <Garasi onTabChange={setActiveTab} />}
+        {activeTab === 'hr' && <HR onTabChange={setActiveTab} />}
+        {activeTab === 'bengkel' && <Bengkel onTabChange={setActiveTab} />}
       </main>
 
       <footer className="mx-auto max-w-7xl px-6 pb-10 pt-2 text-center text-[11px] text-white/30">
-        Raja Pantura · Tycoon Bus Malam · Phase 1 Build · Save tersimpan otomatis di browser ini.
+        Raja Pantura · Tycoon Bus Malam · Phase 2 Build · Save tersimpan di browser ini.
       </footer>
 
-      {/* Global daily report modal — overlays any tab. */}
+      {/* Pending event blocks until the player chooses or acknowledges. */}
+      <EventModal />
+      {/* Post-dispatch financial recap. */}
       <DailyReportModal />
     </div>
   );
