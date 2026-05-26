@@ -8,7 +8,8 @@ import {
 } from '../data/busTypes';
 import { previewTripEconomics } from '../utils/economics';
 import { STAMINA_FLOOR_TO_DRIVE } from '../data/staff';
-import { formatIDR, formatIDRCompact, formatPercent } from '../utils/format';
+import { ASSET_LIST, tripResourceCost } from '../utils/market';
+import { formatIDR, formatIDRCompact, formatNumber, formatPercent } from '../utils/format';
 
 export default function Dashboard({ onTabChange }) {
   const { state, routesById, driversById, kernetsById, beginDispatch } = useGame();
@@ -30,11 +31,38 @@ export default function Dashboard({ onTabChange }) {
           })
         : null;
 
-      return { bus, busType, route, driver, kernet, preview, blocker };
+      const cost = busType && route
+        ? tripResourceCost({ distanceKm: route.distanceKm, fuelEfficiency: busType.fuelEfficiency })
+        : null;
+
+      return { bus, busType, route, driver, kernet, preview, blocker, cost };
     });
   }, [state.fleet, routesById, driversById, kernetsById]);
 
   const readyCount = fleetView.filter((p) => !p.blocker).length;
+
+  // Aggregate inventory cost for ready-to-dispatch buses.
+  const totalCost = useMemo(() => {
+    return fleetView.reduce(
+      (acc, p) => {
+        if (p.blocker || !p.cost) return acc;
+        acc.fuel += p.cost.fuel;
+        acc.tires += p.cost.tires;
+        acc.parts += p.cost.parts;
+        return acc;
+      },
+      { fuel: 0, tires: 0, parts: 0 }
+    );
+  }, [fleetView]);
+
+  // What the player has on hand vs. what tonight will burn.
+  const inventory = state.inventory;
+  const inventoryShort = {
+    fuel: Math.max(0, totalCost.fuel - inventory.fuel),
+    tires: Math.max(0, totalCost.tires - inventory.tires),
+    parts: Math.max(0, totalCost.parts - inventory.parts),
+  };
+  const anyShort = inventoryShort.fuel > 0 || inventoryShort.tires > 0 || inventoryShort.parts > 0;
 
   const totalsPreview = useMemo(() => {
     return fleetView.reduce(
@@ -141,6 +169,17 @@ export default function Dashboard({ onTabChange }) {
         </div>
       </section>
 
+      {/* Inventory readiness — what tonight's dispatch will burn vs. what
+          we have on hand. */}
+      <InventoryReadinessPanel
+        inventory={inventory}
+        totalCost={totalCost}
+        shortfall={inventoryShort}
+        anyShort={anyShort}
+        marketPrices={state.marketPrices}
+        onTabChange={onTabChange}
+      />
+
       {/* Fleet list */}
       <section>
         <div className="mb-3 flex items-end justify-between">
@@ -209,6 +248,99 @@ function PreviewStat({ label, value, hint, tone = 'sky' }) {
       <span className={`mt-0.5 text-lg font-bold ${tones[tone]}`}>{value}</span>
       <span className="mt-0.5 text-[11px] text-white/40">{hint}</span>
     </div>
+  );
+}
+
+// Inventory readiness — quick check of "have I stocked enough for tonight?".
+// Renders nothing if there's literally nothing to dispatch yet.
+function InventoryReadinessPanel({
+  inventory,
+  totalCost,
+  shortfall,
+  anyShort,
+  marketPrices,
+  onTabChange,
+}) {
+  const hasAnyDemand = totalCost.fuel > 0 || totalCost.tires > 0 || totalCost.parts > 0;
+
+  return (
+    <section className="glass-panel p-5">
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 className="font-display text-sm font-bold text-white">
+            🏭 Gudang &amp; Konsumsi Malam Ini
+          </h3>
+          <p className="text-[11px] text-white/55">
+            Bus tidak akan berangkat kalau stok komoditasnya kurang. Cek tab Pasar buat re-stok.
+          </p>
+        </div>
+        <button onClick={() => onTabChange('pasar')} className="btn-secondary text-xs">
+          Pasar &amp; Gudang →
+        </button>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-3">
+        {ASSET_LIST.map((a) => {
+          const stock = inventory[a.id] ?? 0;
+          const need = totalCost[a.id] ?? 0;
+          const short = shortfall[a.id] ?? 0;
+          const ok = need === 0 || stock >= need;
+          return (
+            <div
+              key={a.id}
+              className={`rounded-xl border px-3 py-2.5 ${
+                ok
+                  ? 'border-white/10 bg-black/25'
+                  : 'border-rose-400/40 bg-rose-500/10'
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-lg">{a.icon}</span>
+                  <span className="font-display text-sm font-bold text-white">{a.name}</span>
+                </div>
+                <span className={`pill ${ok ? a.badge : 'border-rose-400/40 bg-rose-500/15 text-rose-200'}`}>
+                  {ok ? 'OK' : `Kurang ${formatNumber(short)} ${a.unit}`}
+                </span>
+              </div>
+              <div className="mt-1.5 grid grid-cols-3 gap-1 text-[11px]">
+                <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
+                  <div className="text-[9px] uppercase tracking-wider text-white/40">Stok</div>
+                  <div className="text-xs font-bold text-white">
+                    {formatNumber(stock)} {a.unit}
+                  </div>
+                </div>
+                <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
+                  <div className="text-[9px] uppercase tracking-wider text-white/40">Butuh</div>
+                  <div className={`text-xs font-bold ${need > 0 ? 'text-amber-300' : 'text-white/55'}`}>
+                    {formatNumber(need)} {a.unit}
+                  </div>
+                </div>
+                <div className="rounded-md border border-white/5 bg-black/30 px-1.5 py-1">
+                  <div className="text-[9px] uppercase tracking-wider text-white/40">Harga</div>
+                  <div className="text-xs font-bold text-emerald-300">
+                    {formatIDRCompact(marketPrices[a.id] ?? a.basePrice)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {anyShort && hasAnyDemand && (
+        <div className="mt-3 flex items-start gap-2 rounded-xl border border-rose-400/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-100">
+          <span className="text-base">⚠</span>
+          <div>
+            <div className="font-semibold">Stok kurang!</div>
+            <div className="text-rose-100/80">
+              Sebagian bus akan dipaksa istirahat malam ini karena gudangnya kosong. Beli dulu di
+              tab Pasar &amp; Gudang.
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 

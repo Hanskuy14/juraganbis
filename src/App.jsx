@@ -7,8 +7,10 @@ import Dealer from './components/Dealer';
 import Garasi from './components/Garasi';
 import KantorPusat from './components/KantorPusat';
 import Bengkel from './components/Bengkel';
+import PasarGudang from './components/PasarGudang';
 import DailyReportModal from './components/DailyReportModal';
 import RoadEventModal from './components/RoadEventModal';
+import TelemetryModal from './components/TelemetryModal';
 
 export default function App() {
   const { hydrated, isGameStarted } = useGame();
@@ -39,6 +41,7 @@ export default function App() {
         {activeTab === 'dashboard' && <Dashboard onTabChange={setActiveTab} />}
         {activeTab === 'dealer' && <Dealer onTabChange={setActiveTab} />}
         {activeTab === 'garasi' && <Garasi onTabChange={setActiveTab} />}
+        {activeTab === 'pasar' && <PasarGudang onTabChange={setActiveTab} />}
         {activeTab === 'hr' && <KantorPusat onTabChange={setActiveTab} />}
         {activeTab === 'bengkel' && <Bengkel onTabChange={setActiveTab} />}
       </main>
@@ -47,10 +50,12 @@ export default function App() {
         Raja Pantura · Tycoon Bus Malam · Phase 2 Build · Save tersimpan otomatis di browser ini.
       </footer>
 
-      {/* Global modals — overlay any tab. Event modal renders ABOVE report
-          because the dispatch flow always resolves the event first, then
-          shows the daily report. */}
+      {/* Global modals — overlay any tab. The dispatch pipeline goes:
+          RoadEventModal -> TelemetryModal -> DailyReportModal. Each one
+          renders only when its slice of state is populated, so they
+          naturally chain in order. */}
       <RoadEventModal />
+      <TelemetryModal />
       <DailyReportModal />
     </div>
   );

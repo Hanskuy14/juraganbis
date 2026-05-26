@@ -6,6 +6,7 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: '📊' },
   { id: 'dealer', label: 'Dealer', icon: '🏪' },
   { id: 'garasi', label: 'Garasi', icon: '🚌' },
+  { id: 'pasar', label: 'Pasar', icon: '📈' },
   { id: 'hr', label: 'Kantor HR', icon: '🏢' },
   { id: 'bengkel', label: 'Bengkel', icon: '🛠️' },
 ];
