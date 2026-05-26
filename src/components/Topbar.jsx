@@ -10,12 +10,18 @@ const TABS = [
   { id: 'pasar', label: 'Pasar', icon: '📈' },
   { id: 'hr', label: 'Kantor HR', icon: '🏢' },
   { id: 'bengkel', label: 'Bengkel', icon: '🛠️' },
+  { id: 'bank', label: 'Bank', icon: '💰' },
+  { id: 'aset', label: 'Aset', icon: '🏗️' },
+  { id: 'leaderboard', label: 'Persaingan', icon: '🏆' },
 ];
 
 export default function Topbar({ activeTab, onTabChange }) {
-  const { state, assignedCount, resetGame } = useGame();
+  const { state, assignedCount, resetGame, REPUTATION_MAX } = useGame();
   const [confirmReset, setConfirmReset] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+
+  const ranking = useGame().ranking ?? [];
+  const playerEntry = ranking.find((e) => e.isPlayer);
 
   return (
     <header className="sticky top-0 z-30 border-b border-white/5 bg-ink-900/70 backdrop-blur-xl">
@@ -48,13 +54,18 @@ export default function Topbar({ activeTab, onTabChange }) {
         </div>
 
         {/* Stats */}
-        <div className="grid grid-cols-3 gap-2 lg:flex lg:items-center lg:gap-3">
+        <div className="grid grid-cols-2 gap-2 lg:flex lg:items-center lg:gap-3">
           <Stat label="Hari" value={`Hari ke-${state.day}`} tone="sky" />
           <Stat
             label="Saldo"
             value={formatIDR(state.balance)}
             tone={state.balance < 0 ? 'rose' : 'emerald'}
             highlight
+          />
+          <Stat
+            label="Reputasi"
+            value={`${state.reputation}/${REPUTATION_MAX}${playerEntry ? ` · #${playerEntry.rank}` : ''}`}
+            tone="fuchsia"
           />
           <Stat
             label="Armada"
@@ -67,7 +78,7 @@ export default function Topbar({ activeTab, onTabChange }) {
       {/* Tab nav (desktop) */}
       <nav className="hidden border-t border-white/5 lg:block">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-6">
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 overflow-x-auto">
             {TABS.map((t) => (
               <TabButton
                 key={t.id}
@@ -124,6 +135,7 @@ function Stat({ label, value, tone = 'sky', highlight = false }) {
     emerald: 'text-emerald-300',
     amber: 'text-amber-300',
     rose: 'text-rose-300',
+    fuchsia: 'text-fuchsia-300',
   };
   return (
     <div
@@ -162,14 +174,14 @@ function TabButton({ active, onClick, icon, label, stacked = false }) {
     <button
       type="button"
       onClick={onClick}
-      className={`relative flex items-center gap-2 px-4 py-3 text-sm font-semibold transition-colors ${
+      className={`relative flex shrink-0 items-center gap-2 px-3 py-3 text-sm font-semibold transition-colors ${
         active ? 'text-amber-300' : 'text-white/60 hover:text-white'
       }`}
     >
       <span>{icon}</span>
       {label}
       {active && (
-        <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-amber-400" />
+        <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-amber-400" />
       )}
     </button>
   );

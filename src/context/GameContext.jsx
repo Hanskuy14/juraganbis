@@ -46,8 +46,34 @@ import {
   totalMarketingSpend,
   MAX_DAILY_AD_SPEND,
 } from '../utils/marketing';
+// Phase 3 (legacy track): Bank, Aset/Upgrades, Leaderboard, Game Over.
+import {
+  garageCapacity,
+  nextGarageLevel,
+  REST_AREA_CONTRACT,
+  REST_AREA_PER_PASSENGER,
+  INTERNAL_MECHANIC,
+  INTERNAL_MECHANIC_DISCOUNT,
+  discountedRepairCost,
+} from '../data/upgrades';
+import {
+  MAX_LOAN_PRINCIPAL,
+  MIN_LOAN_PRINCIPAL,
+  loanInstallment,
+  loanDailyDeduction,
+  tickLoan,
+} from '../data/bank';
+import {
+  initialRivalsState,
+  tickRivals,
+  computeRanking,
+} from '../data/aiRivals';
 
 const STARTING_CAPITAL = 800_000_000;
+const STARTING_REPUTATION = 100;
+const REPUTATION_MAX = 1000;
+const PAILIT_GRACE_DAYS = 5;          // 5 days under Rp 0 -> Game Over
+const CHAMPION_REPUTATION_FLOOR = 950; // need rep >= 950 + Rank #1 + 5+ buses
 
 // --- Initial / empty state ------------------------------------------------
 
@@ -70,11 +96,24 @@ const emptyState = () => {
     marketPrices: market.marketPrices,
     priceHistory: market.priceHistory,
     marketing: initialMarketingState(),
+    // Phase 3 (legacy track) ----------------------------------------------
+    loan: null,                       // { principal, remaining, installment, takenAtDay, totalPaid, totalInterestPaid, daysActive }
+    upgrades: {
+      garageLevel: 1,
+      restAreaContract: false,
+      internalMechanic: false,
+    },
+    reputation: STARTING_REPUTATION,
+    rivals: initialRivalsState(),
+    daysInDebt: 0,                    // consecutive days w/ balance < 0
+    gameOver: null,                   // { reason: 'pailit' | 'champion', day, finalBalance, finalReputation, finalFleetSize }
     createdAt: null,
   };
 };
 
-// Backfill new Phase 2 / 3 fields onto saves from older versions.
+// Backfill new fields onto saves from older versions. Both Phase 2/3 (AI
+// Engine) AND legacy Phase 3 (Bank/Aset/Leaderboard) saves are normalized
+// into the unified shape.
 function migrateSave(saved) {
   if (!saved) return saved;
   const base = emptyState();
@@ -100,24 +139,100 @@ function migrateSave(saved) {
     merged.marketPrices = saved.marketPrices;
     merged.priceHistory = saved.priceHistory;
   }
-  // Marketing/Reviews subsystem (Part 2). Old saves do not have it, so we
-  // backfill with a fresh structure — preserves base rating, no reviews.
+  // Marketing/Reviews subsystem — backfill with fresh structure if missing.
   merged.marketing = {
     ...initialMarketingState(),
     ...(saved.marketing ?? {}),
   };
+  // Phase 3 legacy track (Bank/Aset/Leaderboard).
+  merged.loan = saved.loan ?? null;
+  merged.upgrades = { ...base.upgrades, ...(saved.upgrades ?? {}) };
+  merged.reputation = saved.reputation ?? STARTING_REPUTATION;
+  merged.rivals = (saved.rivals && saved.rivals.length > 0)
+    ? saved.rivals
+    : initialRivalsState();
+  merged.daysInDebt = saved.daysInDebt ?? 0;
+  merged.gameOver = saved.gameOver ?? null;
   return merged;
 }
 
-// --- Helpers used in several reducer branches -----------------------------
+// --- Helpers --------------------------------------------------------------
 
 function unassignFromAllBuses(fleet, idKey, staffId) {
   return fleet.map((b) => (b[idKey] === staffId ? { ...b, [idKey]: null } : b));
 }
 
-// Given an active telemetry session and the legacy event payload, finalize
-// the day: produce the daily report, apply per-bus / per-driver state
-// changes, deduct inventory, and tick the market for tomorrow.
+function clampReputation(value) {
+  return Math.max(0, Math.min(REPUTATION_MAX, Math.round(value)));
+}
+
+// Reputation delta from a single dispatch. Combines the legacy heuristics
+// (occupancy / mogok / event choice) with the new visibility-tier signals.
+function reputationDeltaForDispatch(rows, event) {
+  let delta = 0;
+  for (const r of rows) {
+    if (r.idle) continue;
+    // Filling demand: +0..+5 per bus (occupancy * 5).
+    delta += Math.round((r.occupancy ?? 0) * 5);
+    // Predatory pricing: premium tariff with empty bus -> rep hit.
+    if (r.strategy === 'premium' && (r.occupancy ?? 0) < 0.4) {
+      delta -= 4;
+    }
+    // Mogok/crash = passengers stranded.
+    if (r.crashed) delta -= 18;
+    else if (r.breakdown) delta -= 10;
+    // Top-page-1 visibility says "PO is talked about" -> +1.
+    if (r.visibilityTier === 'top') delta += 1;
+  }
+  if (event?.id === 'razia' && event.choice === 'refuse') delta += 6;
+  if (event?.id === 'razia' && event.choice === 'bribe') delta -= 2;
+  if (event?.id === 'tiktok') delta += 5;
+  if (event?.id === 'macet') delta -= 1;
+  return delta;
+}
+
+// Game-over detection. Returns the new gameOver descriptor or null.
+function detectGameOver(state, day, balance, reputation, fleet, rivals) {
+  if (state.gameOver) return state.gameOver;
+  const inDebt = balance < 0;
+  const daysInDebt = inDebt ? state.daysInDebt + 1 : 0;
+  if (daysInDebt >= PAILIT_GRACE_DAYS) {
+    return {
+      reason: 'pailit',
+      day,
+      finalBalance: balance,
+      finalReputation: reputation,
+      finalFleetSize: fleet.length,
+    };
+  }
+  if (reputation >= CHAMPION_REPUTATION_FLOOR && fleet.length >= 5) {
+    const ranking = computeRanking(
+      { id: '__player', name: state.poName, reputation, fleet: fleet.length },
+      rivals
+    );
+    const playerEntry = ranking.find((e) => e.isPlayer);
+    if (playerEntry?.rank === 1) {
+      return {
+        reason: 'champion',
+        day,
+        finalBalance: balance,
+        finalReputation: reputation,
+        finalFleetSize: fleet.length,
+      };
+    }
+  }
+  return null;
+}
+
+// Given an active telemetry session, finalize the day:
+//   - resolve every dispatched bus into a per-bus report row
+//   - apply fleet/driver state changes
+//   - charge inventory (incl. emergency pitstop tires)
+//   - charge marketing ad spend
+//   - generate reviews + apply shadowban
+//   - apply Phase 3 ledger extras (rest area income, loan tick, internal
+//     mechanic discount on breakdown fines, reputation drift, AI rivals tick)
+//   - check game-over (pailit / champion)
 function finalizeFromTelemetry(state) {
   const session = state.activeTrip;
   if (!session) return state;
@@ -127,8 +242,6 @@ function finalizeFromTelemetry(state) {
   const kernetsById = Object.fromEntries(state.kernets.map((k) => [k.id, k]));
   const tiktokBoostActive = state.tiktokBoostDaysLeft > 0;
 
-  // Resolve every dispatched bus into a report row using the telemetry
-  // outcome (overheat / blowout overrides the random condition roll).
   const tripRows = session.frames
     .map((frame) => {
       const bus = state.fleet.find((b) => b.id === frame.busId);
@@ -146,11 +259,27 @@ function finalizeFromTelemetry(state) {
     })
     .filter(Boolean);
 
+  // Apply internal-mechanic discount on any breakdown fines.
+  if (state.upgrades.internalMechanic) {
+    for (const r of tripRows) {
+      if (r.repairFine && r.repairFine > 0) {
+        const before = r.repairFine;
+        const discounted = Math.round(before * (1 - INTERNAL_MECHANIC_DISCOUNT));
+        const saved = before - discounted;
+        r.repairFine = discounted;
+        r.profit += saved;
+        r.eventNotes = [
+          ...(r.eventNotes ?? []),
+          `🔧 Montir internal: denda mogok turun ${Math.round(INTERNAL_MECHANIC_DISCOUNT * 100)}% (-${formatRpQuick(saved)})`,
+        ];
+      }
+    }
+  }
+
   const rows = [...tripRows, ...session.idleRows];
   const totals = summarizeReport(rows);
 
-  // Marketing budget — paid per dispatched bus on the route. Players who
-  // dispatched 5 buses on a Rp 250.000/day route pay Rp 1.250.000 today.
+  // Marketing budget — paid per dispatched bus on the route.
   const marketingSpend = totalMarketingSpend(state.marketing, session.frames);
 
   // Apply fleet condition + driver stamina changes.
@@ -170,9 +299,7 @@ function finalizeFromTelemetry(state) {
     };
   });
 
-  // Inventory: pre-paid resources were already earmarked in the plan via
-  // session.totalCost. Deduct now (broken-down buses still burn fuel/tires).
-  // ALSO deduct any emergency pitstop tires that were consumed mid-trip.
+  // Inventory + emergency-pitstop tires.
   const pitstopTires = session.frames.filter((f) => f.usedEmergencyPitstop).length;
   const totalConsumed = {
     fuel: session.totalCost.fuel,
@@ -188,8 +315,7 @@ function finalizeFromTelemetry(state) {
   let tiktokBoostDaysLeft = Math.max(0, state.tiktokBoostDaysLeft - 1);
   if (session.event?.id === 'tiktok') tiktokBoostDaysLeft = 3;
 
-  // Reviews + base-rating drift. Each completed dispatch generates at most
-  // one review per bus; 1-stars trigger a 3-day shadowban.
+  // Reviews + base-rating drift (1-star triggers shadowban).
   let marketing = state.marketing ?? initialMarketingState();
   for (const row of tripRows) {
     if (row.idle) continue;
@@ -211,10 +337,59 @@ function finalizeFromTelemetry(state) {
     }
   }
 
+  // Phase 3 ledger extras ---------------------------------------------------
+
+  // Driver vs kernet salary split (cosmetic only).
+  let driverSalaries = 0;
+  let kernetSalaries = 0;
+  for (const r of tripRows) {
+    if (r.idle) continue;
+    if (r.driverId) driverSalaries += driverTripSalary(r.driverSkill ?? 5);
+    if (r.kernetId) kernetSalaries += (r.salaries ?? 0) - driverTripSalary(r.driverSkill ?? 5);
+  }
+  if (driverSalaries + kernetSalaries !== totals.salaries) {
+    driverSalaries = Math.max(0, totals.salaries - kernetSalaries);
+  }
+
+  // Rest-area passive income.
+  const restAreaIncome = state.upgrades.restAreaContract
+    ? totals.passengers * REST_AREA_PER_PASSENGER
+    : 0;
+
+  // Loan installment + interest deduction.
+  const loanPayment = loanDailyDeduction(state.loan);
+  const { loan: nextLoan } = tickLoan(state.loan);
+
+  // Reputation update.
+  const repDelta = reputationDeltaForDispatch(rows, session.event);
+  const reputation = clampReputation(state.reputation + repDelta);
+
+  // AI rivals tick.
+  const newDay = state.day + 1;
+  const rivals = tickRivals(state.rivals, newDay);
+
+  // Net cash for the day = profit + rest area − marketing − loan.
+  const netProfit =
+    totals.profit + restAreaIncome - marketingSpend - loanPayment.total;
+  const balanceBefore = state.balance;
+  const balance = balanceBefore + netProfit;
+  const inDebt = balance < 0;
+  const daysInDebt = inDebt ? state.daysInDebt + 1 : 0;
+
+  // Game over check (pailit after 5 days minus, OR champion at 950 rep + #1).
+  const gameOver = detectGameOver(
+    { ...state, daysInDebt },
+    newDay,
+    balance,
+    reputation,
+    fleet,
+    rivals
+  );
+
   return {
     ...state,
-    day: state.day + 1,
-    balance: state.balance + totals.profit - marketingSpend,
+    day: newDay,
+    balance,
     fleet,
     drivers,
     inventory,
@@ -225,6 +400,11 @@ function finalizeFromTelemetry(state) {
     pendingDispatch: null,
     pendingEvent: null,
     activeTrip: null,
+    loan: nextLoan,
+    reputation,
+    rivals,
+    daysInDebt,
+    gameOver,
     lastReport: {
       day: state.day,
       rows,
@@ -234,8 +414,34 @@ function finalizeFromTelemetry(state) {
       marketingSpend,
       pitstopTires,
       timestamp: Date.now(),
+      // Phase 3 ledger extras shown in the End-of-Day modal.
+      ledger: {
+        balanceBefore,
+        balanceAfter: balance,
+        revenue: totals.revenue,
+        fuelCost: totals.fuelCost,
+        driverSalaries,
+        kernetSalaries,
+        repairFine: totals.repairFine ?? 0,
+        extraExpense: totals.extraExpense ?? 0,
+        marketingSpend,
+        restAreaIncome,
+        loanInstallment: loanPayment.installment,
+        loanInterest: loanPayment.interest,
+        loanTotal: loanPayment.total,
+        netProfit,
+        reputationDelta: repDelta,
+        reputationAfter: reputation,
+        passengers: totals.passengers,
+      },
     },
   };
+}
+
+function formatRpQuick(n) {
+  if (n >= 1_000_000) return `Rp ${Math.round(n / 1_000_000)} Jt`;
+  if (n >= 1_000) return `Rp ${Math.round(n / 1_000)} Rb`;
+  return `Rp ${n}`;
 }
 
 // --- Reducer --------------------------------------------------------------
@@ -263,6 +469,11 @@ function reducer(state, action) {
       const bt = getBusType(busTypeId);
       if (!bt) return state;
       if (state.balance < bt.price) return state;
+
+      // Garage capacity check (Phase 3 legacy).
+      const cap = garageCapacity(state.upgrades.garageLevel);
+      if (state.fleet.length >= cap) return state;
+
       const ordinal = state.fleet.length + 1;
       const fallbackName = `${bt.name.split(' / ')[0]} #${String(ordinal).padStart(2, '0')}`;
       const newBus = {
@@ -277,10 +488,13 @@ function reducer(state, action) {
         assignedDriverId: null,
         assignedKernetId: null,
       };
+      // Premium iron raises reputation a bit.
+      const repBonus = bt.id === 'sleeper' ? 25 : bt.id === 'patas' ? 12 : 4;
       return {
         ...state,
         balance: state.balance - bt.price,
         fleet: [...state.fleet, newBus],
+        reputation: clampReputation(state.reputation + repBonus),
       };
     }
 
@@ -460,11 +674,11 @@ function reducer(state, action) {
       const bt = getBusType(bus.class);
       const points = CONDITION_MAX - (bus.condition ?? 100);
       if (points <= 0) return state;
-      const cost = points * (bt?.repairCostPerPoint ?? 200_000);
+      const rawCost = points * (bt?.repairCostPerPoint ?? 200_000);
+      // Internal mechanic facility (Aset) gives a flat repair discount.
+      const cost = discountedRepairCost(rawCost, state.upgrades.internalMechanic);
       if (state.balance < cost) return state;
-      // Workshop service ALSO consumes 1 spare part if available — costs
-      // are still mostly cash to avoid making bengkel a hard inventory
-      // gate, but tactical players will care.
+      // Workshop service ALSO consumes 1 spare part if available.
       const inventory = (state.inventory.parts ?? 0) > 0
         ? { ...state.inventory, parts: state.inventory.parts - 1 }
         : state.inventory;
@@ -473,7 +687,14 @@ function reducer(state, action) {
           ? { ...b, condition: CONDITION_MAX, inWorkshop: true }
           : b
       );
-      return { ...state, balance: state.balance - cost, fleet, inventory };
+      // Servicing helps reputation a touch — fleet visibly improves.
+      return {
+        ...state,
+        balance: state.balance - cost,
+        fleet,
+        inventory,
+        reputation: clampReputation(state.reputation + 1),
+      };
     }
 
     // -- Market & Inventory ---------------------------------------------
@@ -496,7 +717,6 @@ function reducer(state, action) {
       const asset = ASSETS[assetId];
       if (!asset || quantity <= 0) return state;
       if ((state.inventory[assetId] ?? 0) < quantity) return state;
-      // Sell-back at 90% of current market — small spread punishes flipping.
       const price = state.marketPrices[assetId] ?? asset.basePrice;
       const revenue = Math.round(price * quantity * 0.9);
       return {
@@ -506,8 +726,74 @@ function reducer(state, action) {
       };
     }
 
+    // -- Bank ------------------------------------------------------------
+    case 'APPLY_LOAN': {
+      if (state.loan) return state;
+      const principal = Math.max(0, Math.min(MAX_LOAN_PRINCIPAL, Math.round(action.principal)));
+      if (principal < MIN_LOAN_PRINCIPAL) return state;
+      return {
+        ...state,
+        balance: state.balance + principal,
+        loan: {
+          principal,
+          remaining: principal,
+          installment: loanInstallment(principal),
+          takenAtDay: state.day,
+          totalPaid: 0,
+          totalInterestPaid: 0,
+          daysActive: 0,
+        },
+      };
+    }
+
+    case 'REPAY_LOAN_FULL': {
+      if (!state.loan) return state;
+      if (state.balance < state.loan.remaining) return state;
+      return {
+        ...state,
+        balance: state.balance - state.loan.remaining,
+        loan: null,
+      };
+    }
+
+    // -- Aset / Upgrades -------------------------------------------------
+    case 'UPGRADE_GARAGE': {
+      const next = nextGarageLevel(state.upgrades.garageLevel);
+      if (!next) return state;
+      if (state.balance < next.upgradeCost) return state;
+      return {
+        ...state,
+        balance: state.balance - next.upgradeCost,
+        upgrades: { ...state.upgrades, garageLevel: next.level },
+        reputation: clampReputation(state.reputation + 8),
+      };
+    }
+
+    case 'BUY_REST_AREA_CONTRACT': {
+      if (state.upgrades.restAreaContract) return state;
+      if (state.balance < REST_AREA_CONTRACT.cost) return state;
+      return {
+        ...state,
+        balance: state.balance - REST_AREA_CONTRACT.cost,
+        upgrades: { ...state.upgrades, restAreaContract: true },
+        reputation: clampReputation(state.reputation + 6),
+      };
+    }
+
+    case 'BUY_INTERNAL_MECHANIC': {
+      if (state.upgrades.internalMechanic) return state;
+      if (state.balance < INTERNAL_MECHANIC.cost) return state;
+      return {
+        ...state,
+        balance: state.balance - INTERNAL_MECHANIC.cost,
+        upgrades: { ...state.upgrades, internalMechanic: true },
+        reputation: clampReputation(state.reputation + 6),
+      };
+    }
+
     // -- Dispatch flow ---------------------------------------------------
     case 'BEGIN_DISPATCH': {
+      if (state.gameOver) return state;
       if (state.pendingEvent || state.activeTrip) return state;
 
       const routesById = Object.fromEntries(state.routes.map((r) => [r.id, r]));
@@ -525,16 +811,31 @@ function reducer(state, action) {
         tiktokBoostActive: state.tiktokBoostDaysLeft > 0,
       });
 
-      // No bus actually goes out today — emit an empty report immediately
-      // (otherwise the Telemetry modal would just be a "settled" dialog
-      // with nothing to watch).
+      // No bus actually goes out today — emit an empty report immediately.
+      // Loan/rivals/reputation still tick because a day passes.
       if (plan.frames.length === 0) {
         const totals = summarizeReport(plan.idleRows);
-        // Still tick the market — a day passes either way.
         const next = tickMarket(state.marketPrices, state.priceHistory);
+        const loanPayment = loanDailyDeduction(state.loan);
+        const { loan: nextLoan } = tickLoan(state.loan);
+        const newDay = state.day + 1;
+        const rivals = tickRivals(state.rivals, newDay);
+        const balance = state.balance - loanPayment.total;
+        const inDebt = balance < 0;
+        const daysInDebt = inDebt ? state.daysInDebt + 1 : 0;
+        const reputation = clampReputation(state.reputation - 1); // idle PO loses tiny rep
+        const gameOver = detectGameOver(
+          { ...state, daysInDebt },
+          newDay,
+          balance,
+          reputation,
+          state.fleet,
+          rivals
+        );
         return {
           ...state,
-          day: state.day + 1,
+          day: newDay,
+          balance,
           marketPrices: next.marketPrices,
           priceHistory: next.priceHistory,
           tiktokBoostDaysLeft: Math.max(0, state.tiktokBoostDaysLeft - 1),
@@ -542,18 +843,42 @@ function reducer(state, action) {
             ...d,
             stamina: Math.min(STAMINA_MAX, (d.stamina ?? 0) + STAMINA_REST_REGEN),
           })),
+          loan: nextLoan,
+          rivals,
+          daysInDebt,
+          reputation,
+          gameOver,
           lastReport: {
             day: state.day,
             rows: plan.idleRows,
             totals,
             event: null,
             resourcesUsed: { fuel: 0, tires: 0, parts: 0 },
+            marketingSpend: 0,
             timestamp: Date.now(),
+            ledger: {
+              balanceBefore: state.balance,
+              balanceAfter: balance,
+              revenue: 0,
+              fuelCost: 0,
+              driverSalaries: 0,
+              kernetSalaries: 0,
+              repairFine: 0,
+              extraExpense: 0,
+              marketingSpend: 0,
+              restAreaIncome: 0,
+              loanInstallment: loanPayment.installment,
+              loanInterest: loanPayment.interest,
+              loanTotal: loanPayment.total,
+              netProfit: -loanPayment.total,
+              reputationDelta: -1,
+              reputationAfter: reputation,
+              passengers: 0,
+            },
           },
         };
       }
 
-      // Project of dispatchable buses for the event roller.
       const dispatchable = plan.frames.map((f) => ({
         busClass: f.busClass,
         driverSkill: f.driverSkill ?? 0,
@@ -561,8 +886,6 @@ function reducer(state, action) {
       const event = rollRoadEvent(dispatchable);
 
       if (event && event.requiresChoice) {
-        // Stash the plan; the telemetry session will start once the event
-        // modal is resolved.
         return {
           ...state,
           pendingEvent: event,
@@ -623,11 +946,8 @@ function reducer(state, action) {
 
     case 'RADIO_EMERGENCY_PITSTOP': {
       if (!state.activeTrip || state.activeTrip.status !== 'running') return state;
-      // Must have at least 1 spare tire on hand.
       if ((state.inventory.tires ?? 0) <= 0) return state;
       const frames = applyFrameEmergencyPitstop(state.activeTrip.frames, action.busId);
-      // Hold the tire deduction until finalize — frame.usedEmergencyPitstop
-      // is the source of truth; finalizer adds it to totalConsumed.
       return { ...state, activeTrip: { ...state.activeTrip, frames } };
     }
 
@@ -652,12 +972,14 @@ function reducer(state, action) {
     }
 
     case 'CLEAR_REPORT': {
-      // Also clears any leftover end-of-day workshop flags so buses are
-      // available again the morning after.
       const fleet = state.fleet.map((b) =>
         b.inWorkshop ? { ...b, inWorkshop: false } : b
       );
       return { ...state, lastReport: null, fleet };
+    }
+
+    case 'ACK_GAME_OVER': {
+      return state; // GameOver modal calls resetGame() instead.
     }
 
     default:
@@ -683,8 +1005,7 @@ export function GameProvider({ children }) {
   useEffect(() => {
     if (!hydrated) return;
     if (!state.poName) return;
-    // Persist everything EXCEPT the live telemetry session — refreshing the
-    // page mid-trip would put the reducer into an awkward state.
+    // Persist everything EXCEPT the live telemetry session.
     const { activeTrip: _ignored, ...persistable } = state;
     writeSave(persistable);
   }, [state, hydrated]);
@@ -770,6 +1091,18 @@ export function GameProvider({ children }) {
   const sellAsset = useCallback((assetId, quantity) =>
     dispatch({ type: 'SELL_ASSET', assetId, quantity }), []);
 
+  // Phase 3: Bank + Aset.
+  const applyLoan = useCallback((principal) =>
+    dispatch({ type: 'APPLY_LOAN', principal }), []);
+  const repayLoanFull = useCallback(() =>
+    dispatch({ type: 'REPAY_LOAN_FULL' }), []);
+  const upgradeGarage = useCallback(() =>
+    dispatch({ type: 'UPGRADE_GARAGE' }), []);
+  const buyRestAreaContract = useCallback(() =>
+    dispatch({ type: 'BUY_REST_AREA_CONTRACT' }), []);
+  const buyInternalMechanic = useCallback(() =>
+    dispatch({ type: 'BUY_INTERNAL_MECHANIC' }), []);
+
   const routesById = useMemo(
     () => Object.fromEntries(state.routes.map((r) => [r.id, r])),
     [state.routes]
@@ -786,6 +1119,25 @@ export function GameProvider({ children }) {
     () => state.fleet.filter((b) => b.assignedRoute && b.assignedDriverId).length,
     [state.fleet]
   );
+  const garageCap = useMemo(
+    () => garageCapacity(state.upgrades.garageLevel),
+    [state.upgrades.garageLevel]
+  );
+  const ranking = useMemo(
+    () =>
+      computeRanking(
+        {
+          id: '__player',
+          name: state.poName || 'PO Anda',
+          reputation: state.reputation,
+          fleet: state.fleet.length,
+          blurb: 'PO milikmu — saatnya jadi Raja Pantura.',
+        },
+        state.rivals
+      ),
+    [state.poName, state.reputation, state.fleet.length, state.rivals]
+  );
+
   const isGameStarted = Boolean(state.poName);
 
   const value = {
@@ -797,7 +1149,11 @@ export function GameProvider({ children }) {
     driversById,
     kernetsById,
     assignedCount,
+    garageCap,
+    ranking,
     STARTING_CAPITAL,
+    REPUTATION_MAX,
+    PAILIT_GRACE_DAYS,
     // actions
     startNewGame,
     continueGame,
@@ -825,6 +1181,12 @@ export function GameProvider({ children }) {
     repairBus,
     buyAsset,
     sellAsset,
+    // phase 3
+    applyLoan,
+    repayLoanFull,
+    upgradeGarage,
+    buyRestAreaContract,
+    buyInternalMechanic,
   };
 
   return <GameContext.Provider value={value}>{children}</GameContext.Provider>;
